@@ -802,6 +802,45 @@ class TestTranscribeAudioDispatch:
         assert result["provider"] == "groq"
         mock_groq.assert_called_once()
 
+    def test_groq_failure_falls_back_to_local_when_configured(self, sample_ogg):
+        config = {
+            "provider": "groq",
+            "fallback_providers": ["local"],
+            "local": {"model": "tiny"},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="groq"), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": False, "transcript": "", "error": "rate limit"},
+             ) as mock_groq, \
+             patch(
+                 "tools.transcription_tools._transcribe_local",
+                 return_value={"success": True, "transcript": "fallback text", "provider": "local"},
+             ) as mock_local:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["provider"] == "local"
+        assert result["fallback_from"] == "groq"
+        mock_groq.assert_called_once()
+        assert mock_local.call_args[0][1] == "tiny"
+
+    def test_groq_failure_without_fallback_returns_primary_error(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "groq"}), \
+             patch("tools.transcription_tools._get_provider", return_value="groq"), \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": False, "transcript": "", "error": "rate limit"},
+             ):
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is False
+        assert result["error"] == "rate limit"
+
     def test_dispatches_to_local(self, sample_ogg):
         with patch("tools.transcription_tools._load_stt_config", return_value={}), \
              patch("tools.transcription_tools._get_provider", return_value="local"), \

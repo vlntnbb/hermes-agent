@@ -1206,6 +1206,7 @@ class GatewayRunner:
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        self._running_agents_task_titles: Dict[str, str] = {}  # first-message preview per running turn
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Overflow buffer for explicit /queue commands.  The adapter-level
         # _pending_messages dict is a single slot per session (designed for
@@ -2595,6 +2596,10 @@ class GatewayRunner:
                     status_parts.append(f"running: {current_tool}")
             except Exception:
                 pass
+        task_titles = getattr(self, "_running_agents_task_titles", None)
+        task_title = task_titles.get(session_key) if isinstance(task_titles, dict) else None
+        if task_title:
+            status_parts.insert(0, f"task: {task_title}")
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
         if is_steer_mode:
@@ -2763,8 +2768,7 @@ class GatewayRunner:
                 if not adapter:
                     continue
 
-                platform_cfg = self.config.platforms.get(platform)
-                if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                if not self.config.should_send_gateway_restart_notification(platform):
                     logger.info(
                         "Shutdown notification suppressed for active session: %s has gateway_restart_notification=false",
                         platform_str,
@@ -2806,8 +2810,7 @@ class GatewayRunner:
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            if not self.config.should_send_gateway_restart_notification(platform):
                 logger.info(
                     "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
                     platform.value,
@@ -6641,6 +6644,7 @@ class GatewayRunner:
         # same session — corrupting the transcript.
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        self._running_agents_task_titles[_quick_key] = self._busy_ack_task_title(event)
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
@@ -11642,10 +11646,13 @@ class GatewayRunner:
         args = event.get_command_args().strip()
 
         # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
-        args = re.sub(r'[\u2012\u2013\u2014\u2015](days|source)', r'--\1', args)
+        args = re.sub(r'[\u2012\u2013\u2014\u2015](days|source|model|models|daily|by-day|usage)', r'--\1', args)
 
         days = 30
         source = None
+        model_filters: list[str] = []
+        daily = False
+        usage_report = False
 
         # Parse simple args: /insights 7  or  /insights --days 7
         if args:
@@ -11661,6 +11668,17 @@ class GatewayRunner:
                 elif parts[i] == "--source" and i + 1 < len(parts):
                     source = parts[i + 1]
                     i += 2
+                elif parts[i] in ("--model", "--models") and i + 1 < len(parts):
+                    model_filters.extend([m for m in parts[i + 1].split(",") if m])
+                    usage_report = True
+                    i += 2
+                elif parts[i] in ("--daily", "--by-day"):
+                    daily = True
+                    usage_report = True
+                    i += 1
+                elif parts[i] == "--usage":
+                    usage_report = True
+                    i += 1
                 elif parts[i].isdigit():
                     days = int(parts[i])
                     i += 1
@@ -11676,8 +11694,17 @@ class GatewayRunner:
             def _run_insights():
                 db = SessionDB()
                 engine = InsightsEngine(db)
-                report = engine.generate(days=days, source=source)
-                result = engine.format_gateway(report)
+                if usage_report:
+                    report = engine.generate_usage(
+                        days=days,
+                        source=source,
+                        models=model_filters,
+                        daily=daily,
+                    )
+                    result = engine.format_usage_gateway(report)
+                else:
+                    report = engine.generate(days=days, source=source)
+                    result = engine.format_gateway(report)
                 db.close()
                 return result
 
@@ -12766,8 +12793,7 @@ class GatewayRunner:
                 )
                 return None
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            if not self.config.should_send_gateway_restart_notification(platform):
                 logger.info(
                     "Restart notification suppressed: %s has gateway_restart_notification=false",
                     platform_str,
@@ -12825,8 +12851,7 @@ class GatewayRunner:
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            if not self.config.should_send_gateway_restart_notification(platform):
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
                     platform.value,
@@ -13501,9 +13526,25 @@ class GatewayRunner:
             return False
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
+        if hasattr(self, "_running_agents_task_titles"):
+            self._running_agents_task_titles.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
         return True
+
+    @staticmethod
+    def _busy_ack_task_title(event: MessageEvent) -> str:
+        """Return a compact, user-visible title for busy-session acknowledgments."""
+        text = " ".join(str(getattr(event, "text", "") or "").split())
+        if not text:
+            media_types = [str(t) for t in (getattr(event, "media_types", None) or []) if t]
+            if media_types:
+                text = "+".join(media_types)
+            else:
+                text = "message"
+        # Avoid very wide Telegram/Slack pings while still making it obvious
+        # which turn is being interrupted/queued/steered into.
+        return text[:80] + ("…" if len(text) > 80 else "")
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
         """Clear per-session control state that must not survive a boundary switch."""

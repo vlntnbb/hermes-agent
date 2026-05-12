@@ -294,6 +294,106 @@ def _get_provider(stt_config: dict) -> str:
         return "xai"
     return "none"
 
+
+def _configured_fallback_providers(stt_config: dict, primary_provider: str) -> list[str]:
+    """Return normalized STT fallback providers from config.
+
+    Supported forms:
+      stt.fallback_providers: ["local"]
+      stt.fallback_providers: "local,openai"
+    """
+    raw = stt_config.get("fallback_providers", [])
+    if isinstance(raw, str):
+        providers = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        providers = [str(part).strip() for part in raw]
+    else:
+        providers = []
+
+    normalized: list[str] = []
+    for provider in providers:
+        if not provider:
+            continue
+        provider = provider.lower()
+        if provider == primary_provider or provider in normalized:
+            continue
+        normalized.append(provider)
+    return normalized
+
+
+def _transcribe_fallback_provider(
+    provider: str,
+    file_path: str,
+    stt_config: dict,
+) -> Optional[Dict[str, Any]]:
+    """Run one configured fallback provider, or return None if unavailable."""
+    if provider == "local":
+        local_cfg = stt_config.get("local", {})
+        model_name = _normalize_local_model(local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+        if _HAS_FASTER_WHISPER:
+            return _transcribe_local(file_path, model_name)
+        if _has_local_command():
+            return _transcribe_local_command(file_path, model_name)
+        logger.warning(
+            "STT fallback provider 'local' unavailable "
+            "(install faster-whisper or set HERMES_LOCAL_STT_COMMAND)"
+        )
+        return None
+
+    if provider == "local_command":
+        local_cfg = stt_config.get("local", {})
+        model_name = _normalize_local_command_model(
+            local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        )
+        if _has_local_command():
+            return _transcribe_local_command(file_path, model_name)
+        logger.warning("STT fallback provider 'local_command' unavailable")
+        return None
+
+    logger.warning("Unknown STT fallback provider '%s' configured", provider)
+    return None
+
+
+def _try_transcription_fallbacks(
+    file_path: str,
+    stt_config: dict,
+    primary_provider: str,
+    primary_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Try configured fallback providers after a primary STT failure."""
+    fallback_errors: list[str] = []
+    primary_error = primary_result.get("error") or "unknown error"
+
+    for fallback_provider in _configured_fallback_providers(stt_config, primary_provider):
+        logger.warning(
+            "STT provider '%s' failed (%s); trying fallback '%s'",
+            primary_provider,
+            primary_error,
+            fallback_provider,
+        )
+        fallback_result = _transcribe_fallback_provider(
+            fallback_provider,
+            file_path,
+            stt_config,
+        )
+        if not fallback_result:
+            fallback_errors.append(f"{fallback_provider}: unavailable")
+            continue
+        if fallback_result.get("success"):
+            fallback_result["fallback_from"] = primary_provider
+            return fallback_result
+        fallback_errors.append(
+            f"{fallback_provider}: {fallback_result.get('error') or 'unknown error'}"
+        )
+
+    if fallback_errors:
+        primary_result = dict(primary_result)
+        primary_result["error"] = (
+            f"{primary_provider} failed: {primary_error}; "
+            f"fallbacks failed: {'; '.join(fallback_errors)}"
+        )
+    return primary_result
+
 # ---------------------------------------------------------------------------
 # Shared validation
 # ---------------------------------------------------------------------------
@@ -841,7 +941,10 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     if provider == "groq":
         model_name = model or DEFAULT_GROQ_STT_MODEL
-        return _transcribe_groq(file_path, model_name)
+        result = _transcribe_groq(file_path, model_name)
+        if result.get("success"):
+            return result
+        return _try_transcription_fallbacks(file_path, stt_config, "groq", result)
 
     if provider == "openai":
         openai_cfg = stt_config.get("openai", {})

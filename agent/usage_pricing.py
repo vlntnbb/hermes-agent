@@ -59,6 +59,11 @@ class PricingEntry:
     output_cost_per_million: Optional[Decimal] = None
     cache_read_cost_per_million: Optional[Decimal] = None
     cache_write_cost_per_million: Optional[Decimal] = None
+    long_context_threshold_tokens: Optional[int] = None
+    long_context_input_cost_per_million: Optional[Decimal] = None
+    long_context_output_cost_per_million: Optional[Decimal] = None
+    long_context_cache_read_cost_per_million: Optional[Decimal] = None
+    long_context_cache_write_cost_per_million: Optional[Decimal] = None
     request_cost: Optional[Decimal] = None
     source: CostSource = "none"
     source_url: Optional[str] = None
@@ -373,6 +378,51 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # Google Gemini
     (
         "google",
+        "gemini-3.1-pro-preview",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        long_context_threshold_tokens=200_000,
+        long_context_input_cost_per_million=Decimal("4.00"),
+        long_context_output_cost_per_million=Decimal("18.00"),
+        long_context_cache_read_cost_per_million=Decimal("0.40"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-05-12",
+    ),
+    (
+        "google",
+        "gemini-3.1-pro-preview-customtools",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        long_context_threshold_tokens=200_000,
+        long_context_input_cost_per_million=Decimal("4.00"),
+        long_context_output_cost_per_million=Decimal("18.00"),
+        long_context_cache_read_cost_per_million=Decimal("0.40"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-05-12",
+    ),
+    (
+        "google",
+        "gemini-3.1-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        long_context_threshold_tokens=200_000,
+        long_context_input_cost_per_million=Decimal("4.00"),
+        long_context_output_cost_per_million=Decimal("18.00"),
+        long_context_cache_read_cost_per_million=Decimal("0.40"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-05-12",
+    ),
+    (
+        "google",
         "gemini-2.5-pro",
     ): PricingEntry(
         input_cost_per_million=Decimal("1.25"),
@@ -521,11 +571,18 @@ def resolve_billing_route(
     provider_name = (provider or "").strip().lower()
     base = (base_url or "").strip().lower()
     model = (model_name or "").strip()
+    if provider_name in {"gemini", "google-gemini", "google-ai-studio"}:
+        provider_name = "google"
     if not provider_name and "/" in model:
         inferred_provider, bare_model = model.split("/", 1)
         if inferred_provider in {"anthropic", "openai", "google"}:
             provider_name = inferred_provider
             model = bare_model
+        elif inferred_provider in {"gemini", "google-gemini", "google-ai-studio"}:
+            provider_name = "google"
+            model = bare_model
+    if not provider_name and model.lower().startswith("gemini-"):
+        provider_name = "google"
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
@@ -535,6 +592,8 @@ def resolve_billing_route(
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "openai":
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name == "google":
+        return BillingRoute(provider="google", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
@@ -755,13 +814,28 @@ def estimate_usage_cost(
 
     notes: list[str] = []
     amount = _ZERO
+    input_rate = entry.input_cost_per_million
+    output_rate = entry.output_cost_per_million
+    cache_read_rate = entry.cache_read_cost_per_million
+    cache_write_rate = entry.cache_write_cost_per_million
+    if (
+        entry.long_context_threshold_tokens
+        and usage.prompt_tokens > entry.long_context_threshold_tokens
+    ):
+        input_rate = entry.long_context_input_cost_per_million or input_rate
+        output_rate = entry.long_context_output_cost_per_million or output_rate
+        cache_read_rate = entry.long_context_cache_read_cost_per_million or cache_read_rate
+        cache_write_rate = entry.long_context_cache_write_cost_per_million or cache_write_rate
+        notes.append(
+            f"long-context tier applied above {entry.long_context_threshold_tokens:,} prompt tokens"
+        )
 
-    if usage.input_tokens and entry.input_cost_per_million is None:
+    if usage.input_tokens and input_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
-    if usage.output_tokens and entry.output_cost_per_million is None:
+    if usage.output_tokens and output_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
     if usage.cache_read_tokens:
-        if entry.cache_read_cost_per_million is None:
+        if cache_read_rate is None:
             return CostResult(
                 amount_usd=None,
                 status="unknown",
@@ -770,7 +844,7 @@ def estimate_usage_cost(
                 notes=("cache-read pricing unavailable for route",),
             )
     if usage.cache_write_tokens:
-        if entry.cache_write_cost_per_million is None:
+        if cache_write_rate is None:
             return CostResult(
                 amount_usd=None,
                 status="unknown",
@@ -779,14 +853,14 @@ def estimate_usage_cost(
                 notes=("cache-write pricing unavailable for route",),
             )
 
-    if entry.input_cost_per_million is not None:
-        amount += Decimal(usage.input_tokens) * entry.input_cost_per_million / _ONE_MILLION
-    if entry.output_cost_per_million is not None:
-        amount += Decimal(usage.output_tokens) * entry.output_cost_per_million / _ONE_MILLION
-    if entry.cache_read_cost_per_million is not None:
-        amount += Decimal(usage.cache_read_tokens) * entry.cache_read_cost_per_million / _ONE_MILLION
-    if entry.cache_write_cost_per_million is not None:
-        amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
+    if input_rate is not None:
+        amount += Decimal(usage.input_tokens) * input_rate / _ONE_MILLION
+    if output_rate is not None:
+        amount += Decimal(usage.output_tokens) * output_rate / _ONE_MILLION
+    if cache_read_rate is not None:
+        amount += Decimal(usage.cache_read_tokens) * cache_read_rate / _ONE_MILLION
+    if cache_write_rate is not None:
+        amount += Decimal(usage.cache_write_tokens) * cache_write_rate / _ONE_MILLION
     if entry.request_cost is not None and usage.request_count:
         amount += Decimal(usage.request_count) * entry.request_cost
 

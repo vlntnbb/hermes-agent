@@ -62,6 +62,7 @@ def _make_runner():
     runner = object.__new__(GatewayRunner)
     runner._running_agents = {}
     runner._running_agents_ts = {}
+    runner._running_agents_task_titles = {}
     runner._pending_messages = {}
     runner._busy_ack_ts = {}
     runner._draining = False
@@ -140,6 +141,7 @@ class TestBusySessionAck:
         }
         runner._running_agents[sk] = agent
         runner._running_agents_ts[sk] = time.time() - 600  # 10 min ago
+        runner._running_agents_task_titles[sk] = "Save Neurosprint to Obsidian"
         runner.adapters[event.source.platform] = adapter
 
         result = await runner._handle_active_session_busy_message(event, sk)
@@ -153,6 +155,7 @@ class TestBusySessionAck:
             # positional args
             content = str(call_kwargs)
         assert "Interrupting" in content or "respond" in content
+        assert "task: Save Neurosprint to Obsidian" in content
         assert "/stop" not in content  # no need — we ARE interrupting
 
         # Verify agent interrupt was called

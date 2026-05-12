@@ -447,6 +447,7 @@ class GatewayConfig:
     
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
+    gateway_restart_notification: bool = True  # Global lifecycle notification switch
 
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
@@ -518,6 +519,15 @@ class GatewayConfig:
         if config:
             return config.home_channel
         return None
+
+    def should_send_gateway_restart_notification(self, platform: Platform) -> bool:
+        """Return whether gateway lifecycle notifications may be sent."""
+        if not self.gateway_restart_notification:
+            return False
+        platform_cfg = self.platforms.get(platform)
+        if platform_cfg is not None:
+            return platform_cfg.gateway_restart_notification
+        return True
     
     def get_reset_policy(
         self, 
@@ -555,6 +565,7 @@ class GatewayConfig:
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             "always_log_local": self.always_log_local,
+            "gateway_restart_notification": self.gateway_restart_notification,
             "stt_enabled": self.stt_enabled,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
@@ -623,6 +634,9 @@ class GatewayConfig:
             quick_commands=quick_commands,
             sessions_dir=sessions_dir,
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
+            gateway_restart_notification=_coerce_bool(
+                data.get("gateway_restart_notification"), True
+            ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
@@ -726,21 +740,37 @@ def load_gateway_config() -> GatewayConfig:
             if "always_log_local" in yaml_cfg:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]
 
+            yaml_gateway = yaml_cfg.get("gateway")
+            if isinstance(yaml_gateway, dict) and "gateway_restart_notification" in yaml_gateway:
+                gw_data["gateway_restart_notification"] = yaml_gateway[
+                    "gateway_restart_notification"
+                ]
+            if "gateway_restart_notification" in yaml_cfg:
+                gw_data["gateway_restart_notification"] = yaml_cfg[
+                    "gateway_restart_notification"
+                ]
+
             if "unauthorized_dm_behavior" in yaml_cfg:
                 gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
                     yaml_cfg.get("unauthorized_dm_behavior"),
                     "pair",
                 )
 
-            # Merge platforms section from config.yaml into gw_data so that
+            # Merge platform sections from config.yaml into gw_data so that
             # nested keys like platforms.webhook.extra.routes are loaded.
-            yaml_platforms = yaml_cfg.get("platforms")
+            #
+            # Older docs and config commands wrote these under
+            # gateway.platforms.*.  Keep accepting that wrapper and let the
+            # top-level platforms.* form win when both are present.
             platforms_data = gw_data.setdefault("platforms", {})
             if not isinstance(platforms_data, dict):
                 platforms_data = {}
                 gw_data["platforms"] = platforms_data
-            if isinstance(yaml_platforms, dict):
-                for plat_name, plat_block in yaml_platforms.items():
+
+            def _merge_platform_blocks(platform_blocks: Any) -> None:
+                if not isinstance(platform_blocks, dict):
+                    return
+                for plat_name, plat_block in platform_blocks.items():
                     if not isinstance(plat_block, dict):
                         continue
                     existing = platforms_data.get(plat_name, {})
@@ -755,6 +785,11 @@ def load_gateway_config() -> GatewayConfig:
                         merged["extra"] = merged_extra
                     platforms_data[plat_name] = merged
                 gw_data["platforms"] = platforms_data
+
+            if isinstance(yaml_gateway, dict):
+                _merge_platform_blocks(yaml_gateway.get("platforms"))
+
+            _merge_platform_blocks(yaml_cfg.get("platforms"))
             for plat in Platform:
                 if plat == Platform.LOCAL:
                     continue

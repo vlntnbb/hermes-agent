@@ -11220,6 +11220,18 @@ Examples:
     insights_parser.add_argument(
         "--source", help="Filter by platform (cli, telegram, discord, etc.)"
     )
+    insights_parser.add_argument(
+        "--model", action="append", help="Filter usage by model (repeatable or comma-separated)"
+    )
+    insights_parser.add_argument(
+        "--models", help="Comma-separated model filter for usage reporting"
+    )
+    insights_parser.add_argument(
+        "--daily", "--by-day", action="store_true", help="Show usage broken down by day"
+    )
+    insights_parser.add_argument(
+        "--usage", action="store_true", help="Show model/token/cost usage ledger"
+    )
 
     def cmd_insights(args):
         try:
@@ -11228,8 +11240,22 @@ Examples:
 
             db = SessionDB()
             engine = InsightsEngine(db)
-            report = engine.generate(days=args.days, source=args.source)
-            print(engine.format_terminal(report))
+            model_filters = []
+            for item in args.model or []:
+                model_filters.extend([m for m in item.split(",") if m])
+            if args.models:
+                model_filters.extend([m for m in args.models.split(",") if m])
+            if args.usage or args.daily or model_filters:
+                report = engine.generate_usage(
+                    days=args.days,
+                    source=args.source,
+                    models=model_filters,
+                    daily=args.daily,
+                )
+                print(engine.format_usage_terminal(report))
+            else:
+                report = engine.generate(days=args.days, source=args.source)
+                print(engine.format_terminal(report))
             db.close()
         except Exception as e:
             print(f"Error generating insights: {e}")

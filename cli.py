@@ -8793,6 +8793,9 @@ class HermesCLI:
         parts = command.split()
         days = 30
         source = None
+        model_filters = []
+        daily = False
+        usage_report = False
         i = 1
         while i < len(parts):
             if parts[i] == "--days" and i + 1 < len(parts):
@@ -8805,6 +8808,17 @@ class HermesCLI:
             elif parts[i] == "--source" and i + 1 < len(parts):
                 source = parts[i + 1]
                 i += 2
+            elif parts[i] in ("--model", "--models") and i + 1 < len(parts):
+                model_filters.extend([m for m in parts[i + 1].split(",") if m])
+                usage_report = True
+                i += 2
+            elif parts[i] in ("--daily", "--by-day"):
+                daily = True
+                usage_report = True
+                i += 1
+            elif parts[i] == "--usage":
+                usage_report = True
+                i += 1
             else:
                 i += 1
 
@@ -8814,8 +8828,17 @@ class HermesCLI:
 
             db = SessionDB()
             engine = InsightsEngine(db)
-            report = engine.generate(days=days, source=source)
-            print(engine.format_terminal(report))
+            if usage_report:
+                report = engine.generate_usage(
+                    days=days,
+                    source=source,
+                    models=model_filters,
+                    daily=daily,
+                )
+                print(engine.format_usage_terminal(report))
+            else:
+                report = engine.generate(days=days, source=source)
+                print(engine.format_terminal(report))
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")

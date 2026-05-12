@@ -436,6 +436,73 @@ class TestInsightsPopulated:
         # All 5 sessions should be included
         assert report["overview"]["total_sessions"] == 5
 
+    def test_usage_report_includes_auxiliary_events(self, populated_db):
+        now = time.time()
+        populated_db.record_llm_usage_event(
+            timestamp=now - 3600,
+            session_id="s2",
+            source="telegram",
+            category="auxiliary",
+            task="compression",
+            provider="gemini",
+            model="gemini-3.1-pro-preview",
+            input_tokens=10_000,
+            output_tokens=1_000,
+            total_tokens=11_000,
+            estimated_cost_usd=0.032,
+            cost_status="estimated",
+            cost_source="official_docs_snapshot",
+        )
+        populated_db._conn.commit()
+
+        engine = InsightsEngine(populated_db)
+        report = engine.generate_usage(days=7, models="gemini")
+
+        assert report["empty"] is False
+        assert report["summary"]["auxiliary_events"] == 1
+        assert report["summary"]["total_tokens"] == 11_000
+        assert report["summary"]["estimated_cost"] == pytest.approx(0.032)
+        assert report["models"][0]["model"] == "gemini-3.1-pro-preview"
+        assert report["models"][0]["top_task"] == "compression"
+
+    def test_usage_report_daily_groups_by_day_and_model(self, populated_db):
+        now = time.time()
+        populated_db.record_llm_usage_event(
+            timestamp=now - 3600,
+            source="cli",
+            category="auxiliary",
+            task="compression",
+            provider="gemini",
+            model="gemini-3.1-pro-preview",
+            input_tokens=1000,
+            output_tokens=100,
+            total_tokens=1100,
+            estimated_cost_usd=0.0032,
+            cost_status="estimated",
+        )
+        populated_db.record_llm_usage_event(
+            timestamp=now - 90000,
+            source="cli",
+            category="auxiliary",
+            task="compression",
+            provider="gemini",
+            model="gemini-3.1-pro-preview",
+            input_tokens=2000,
+            output_tokens=200,
+            total_tokens=2200,
+            estimated_cost_usd=0.0064,
+            cost_status="estimated",
+        )
+        populated_db._conn.commit()
+
+        engine = InsightsEngine(populated_db)
+        report = engine.generate_usage(days=7, models=["gemini-3.1-pro-preview"], daily=True)
+
+        assert len(report["daily"]) == 2
+        assert {row["model"] for row in report["daily"]} == {"gemini-3.1-pro-preview"}
+        text = engine.format_usage_gateway(report)
+        assert "By day" in text
+
 
 # =========================================================================
 # Formatting

@@ -168,6 +168,29 @@ def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(m
     assert result.status == "unknown"
 
 
+def test_gemini_provider_alias_uses_google_pricing():
+    result = estimate_usage_cost(
+        "gemini-3.1-pro-preview",
+        CanonicalUsage(input_tokens=1000, output_tokens=500),
+        provider="gemini",
+    )
+
+    assert result.status == "estimated"
+    assert float(result.amount_usd) == (1000 * 2.0 + 500 * 12.0) / 1_000_000
+
+
+def test_gemini_31_pro_long_context_tier_applies_to_whole_request():
+    result = estimate_usage_cost(
+        "gemini-3.1-pro-preview",
+        CanonicalUsage(input_tokens=210_000, output_tokens=10_000),
+        provider="gemini",
+    )
+
+    assert result.status == "estimated"
+    assert float(result.amount_usd) == (210_000 * 4.0 + 10_000 * 18.0) / 1_000_000
+    assert "long-context tier" in result.notes[0]
+
+
 def test_custom_endpoint_models_api_pricing_is_supported(monkeypatch):
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_endpoint_model_metadata",

@@ -4,6 +4,8 @@ import os
 from unittest.mock import patch
 
 from gateway.config import (
+    DEFAULT_STREAMING_BUFFER_THRESHOLD,
+    DEFAULT_STREAMING_EDIT_INTERVAL,
     GatewayConfig,
     HomeChannel,
     Platform,
@@ -69,6 +71,105 @@ class TestPlatformConfigRoundtrip:
     def test_gateway_restart_notification_coerces_quoted_false(self):
         restored = PlatformConfig.from_dict({"gateway_restart_notification": "false"})
         assert restored.gateway_restart_notification is False
+
+
+class TestGatewayPlatformConfigBridge:
+    def test_global_gateway_restart_notification_defaults_true(self):
+        config = GatewayConfig()
+
+        assert config.gateway_restart_notification is True
+        assert config.should_send_gateway_restart_notification(Platform.TELEGRAM) is True
+
+    def test_bridges_gateway_platforms_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            """
+gateway:
+  platforms:
+    telegram:
+      gateway_restart_notification: false
+    email:
+      gateway_restart_notification: "false"
+""",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].gateway_restart_notification is False
+        assert config.platforms[Platform.EMAIL].gateway_restart_notification is False
+
+    def test_bridges_global_gateway_restart_notification_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            """
+gateway_restart_notification: false
+platforms:
+  telegram:
+    gateway_restart_notification: true
+""",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.gateway_restart_notification is False
+        assert config.should_send_gateway_restart_notification(Platform.TELEGRAM) is False
+        assert config.should_send_gateway_restart_notification(Platform.EMAIL) is False
+
+    def test_bridges_nested_global_gateway_restart_notification_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            """
+gateway:
+  gateway_restart_notification: "false"
+""",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.gateway_restart_notification is False
+        assert config.should_send_gateway_restart_notification(Platform.TELEGRAM) is False
+
+    def test_top_level_platforms_override_gateway_platforms(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            """
+gateway:
+  platforms:
+    telegram:
+      gateway_restart_notification: true
+platforms:
+  telegram:
+    gateway_restart_notification: false
+""",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].gateway_restart_notification is False
 
 
 class TestGetConnectedPlatforms:
@@ -176,8 +277,8 @@ class TestStreamingConfig:
                 "fresh_final_after_seconds": "oops",
             }
         )
-        assert restored.edit_interval == 1.0
-        assert restored.buffer_threshold == 40
+        assert restored.edit_interval == DEFAULT_STREAMING_EDIT_INTERVAL
+        assert restored.buffer_threshold == DEFAULT_STREAMING_BUFFER_THRESHOLD
         assert restored.fresh_final_after_seconds == 60.0
 
 

@@ -421,6 +421,8 @@ class ContextCompressor(ContextEngine):
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
+        self._session_id: Optional[str] = None
+        self._session_source: Optional[str] = None
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
@@ -459,6 +461,7 @@ class ContextCompressor(ContextEngine):
                 self.tail_token_budget,
                 provider or "none", base_url or "none",
             )
+
         self._context_probed = False  # True after a step-down from context error
 
         self.last_prompt_tokens = 0
@@ -484,6 +487,10 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+
+    def on_session_start(self, session_id: str, **kwargs) -> None:
+        self._session_id = session_id
+        self._session_source = kwargs.get("platform")
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -944,6 +951,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 },
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
+                "usage_session_id": self._session_id,
+                "usage_source": self._session_source,
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:

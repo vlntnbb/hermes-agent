@@ -20,7 +20,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -80,6 +80,31 @@ def _estimate_cost(
 def _format_duration(seconds: float) -> str:
     """Format seconds into a human-readable duration string."""
     return format_duration_compact(seconds)
+
+
+def _display_model(model: Optional[str]) -> str:
+    model = model or "unknown"
+    return model.split("/")[-1] if "/" in model else model
+
+
+def _normalize_model_filters(models: Optional[str | Sequence[str]]) -> List[str]:
+    if not models:
+        return []
+    if isinstance(models, str):
+        raw = models.split(",")
+    else:
+        raw = []
+        for item in models:
+            raw.extend(str(item).split(","))
+    return [m.strip().lower() for m in raw if m and m.strip()]
+
+
+def _model_matches(model: Optional[str], filters: Sequence[str]) -> bool:
+    if not filters:
+        return True
+    full = (model or "unknown").lower()
+    display = _display_model(model).lower()
+    return any(f == full or f == display or f in full or f in display for f in filters)
 
 
 def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
@@ -172,6 +197,50 @@ class InsightsEngine:
             "top_sessions": top_sessions,
         }
 
+    def generate_usage(
+        self,
+        days: int = 30,
+        source: str = None,
+        models: Optional[str | Sequence[str]] = None,
+        daily: bool = False,
+    ) -> Dict[str, Any]:
+        """Generate a model-centric token/cost usage report.
+
+        This combines the historical session counters with the LLM usage event
+        ledger used for auxiliary calls such as context compression.
+        """
+        cutoff = time.time() - (days * 86400)
+        model_filters = _normalize_model_filters(models)
+        sessions = self._get_sessions(cutoff, source)
+        rows = self._usage_rows_from_sessions(sessions)
+        rows.extend(self._get_llm_usage_events(cutoff, source))
+        if model_filters:
+            rows = [r for r in rows if _model_matches(r.get("model"), model_filters)]
+
+        if not rows:
+            return {
+                "empty": True,
+                "days": days,
+                "source_filter": source,
+                "model_filter": model_filters,
+                "daily_requested": daily,
+                "summary": {},
+                "models": [],
+                "daily": [],
+            }
+
+        return {
+            "empty": False,
+            "days": days,
+            "source_filter": source,
+            "model_filter": model_filters,
+            "daily_requested": daily,
+            "generated_at": time.time(),
+            "summary": self._compute_usage_summary(rows),
+            "models": self._compute_usage_by_model(rows),
+            "daily": self._compute_usage_by_day(rows) if daily else [],
+        }
+
     # =========================================================================
     # Data gathering (SQL queries)
     # =========================================================================
@@ -179,9 +248,11 @@ class InsightsEngine:
     # Columns we actually need (skip system_prompt, model_config blobs)
     _SESSION_COLS = ("id, source, model, started_at, ended_at, "
                      "message_count, tool_call_count, input_tokens, output_tokens, "
-                     "cache_read_tokens, cache_write_tokens, billing_provider, "
+                     "cache_read_tokens, cache_write_tokens, reasoning_tokens, "
+                     "billing_provider, "
                      "billing_base_url, billing_mode, estimated_cost_usd, "
-                     "actual_cost_usd, cost_status, cost_source")
+                     "actual_cost_usd, cost_status, cost_source, "
+                     "pricing_version, api_call_count")
 
     # Pre-computed query strings — f-string evaluated once at class definition,
     # not at runtime, so no user-controlled value can alter the query structure.
@@ -203,6 +274,73 @@ class InsightsEngine:
         else:
             cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
         return [dict(row) for row in cursor.fetchall()]
+
+    def _get_llm_usage_events(self, cutoff: float, source: str = None) -> List[Dict]:
+        """Fetch persisted per-call LLM usage events."""
+        base_cols = (
+            "timestamp, session_id, source, category, task, provider, model, "
+            "base_url, api_mode, input_tokens, output_tokens, cache_read_tokens, "
+            "cache_write_tokens, reasoning_tokens, total_tokens, "
+            "estimated_cost_usd, actual_cost_usd, cost_status, cost_source, "
+            "pricing_version"
+        )
+        try:
+            if source:
+                cursor = self._conn.execute(
+                    f"SELECT {base_cols} FROM llm_usage_events "
+                    "WHERE timestamp >= ? AND source = ? "
+                    "ORDER BY timestamp DESC",
+                    (cutoff, source),
+                )
+            else:
+                cursor = self._conn.execute(
+                    f"SELECT {base_cols} FROM llm_usage_events "
+                    "WHERE timestamp >= ? ORDER BY timestamp DESC",
+                    (cutoff,),
+                )
+        except Exception:
+            return []
+        rows = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            d["calls"] = 1
+            rows.append(d)
+        return rows
+
+    def _usage_rows_from_sessions(self, sessions: List[Dict]) -> List[Dict]:
+        rows = []
+        for s in sessions:
+            input_tokens = s.get("input_tokens") or 0
+            output_tokens = s.get("output_tokens") or 0
+            cache_read = s.get("cache_read_tokens") or 0
+            cache_write = s.get("cache_write_tokens") or 0
+            if input_tokens + output_tokens + cache_read + cache_write <= 0:
+                continue
+            estimated, status = _estimate_cost(s)
+            rows.append({
+                "timestamp": s.get("started_at"),
+                "session_id": s.get("id"),
+                "source": s.get("source"),
+                "category": "main",
+                "task": "chat",
+                "provider": s.get("billing_provider"),
+                "model": s.get("model") or "unknown",
+                "base_url": s.get("billing_base_url"),
+                "api_mode": None,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                "reasoning_tokens": s.get("reasoning_tokens") or 0,
+                "total_tokens": input_tokens + output_tokens + cache_read + cache_write,
+                "estimated_cost_usd": estimated,
+                "actual_cost_usd": s.get("actual_cost_usd"),
+                "cost_status": status,
+                "cost_source": s.get("cost_source"),
+                "pricing_version": s.get("pricing_version"),
+                "calls": s.get("api_call_count") or 1,
+            })
+        return rows
 
     def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
         """Get tool call counts from messages.
@@ -550,6 +688,127 @@ class InsightsEngine:
         result.sort(key=lambda x: x["sessions"], reverse=True)
         return result
 
+    def _compute_usage_summary(self, rows: List[Dict]) -> Dict[str, Any]:
+        total_input = sum(r.get("input_tokens") or 0 for r in rows)
+        total_output = sum(r.get("output_tokens") or 0 for r in rows)
+        total_cache_read = sum(r.get("cache_read_tokens") or 0 for r in rows)
+        total_cache_write = sum(r.get("cache_write_tokens") or 0 for r in rows)
+        total_tokens = sum(
+            r.get("total_tokens")
+            or (
+                (r.get("input_tokens") or 0)
+                + (r.get("output_tokens") or 0)
+                + (r.get("cache_read_tokens") or 0)
+                + (r.get("cache_write_tokens") or 0)
+            )
+            for r in rows
+        )
+        known_cost = sum(
+            r.get("estimated_cost_usd") or 0.0
+            for r in rows
+            if (r.get("cost_status") or "") != "unknown"
+        )
+        unknown_cost_calls = sum(1 for r in rows if (r.get("cost_status") or "") == "unknown")
+        return {
+            "calls": sum(r.get("calls") or 1 for r in rows),
+            "events": len(rows),
+            "main_events": sum(1 for r in rows if r.get("category") == "main"),
+            "auxiliary_events": sum(1 for r in rows if r.get("category") == "auxiliary"),
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "cache_read_tokens": total_cache_read,
+            "cache_write_tokens": total_cache_write,
+            "total_tokens": total_tokens,
+            "estimated_cost": known_cost,
+            "unknown_cost_calls": unknown_cost_calls,
+        }
+
+    def _compute_usage_by_model(self, rows: List[Dict]) -> List[Dict]:
+        grouped = defaultdict(lambda: {
+            "provider": "",
+            "calls": 0,
+            "events": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost": 0.0,
+            "unknown_cost_calls": 0,
+            "tasks": Counter(),
+            "categories": Counter(),
+        })
+        for r in rows:
+            model = _display_model(r.get("model"))
+            d = grouped[model]
+            if not d["provider"] and r.get("provider"):
+                d["provider"] = r.get("provider")
+            d["calls"] += r.get("calls") or 1
+            d["events"] += 1
+            d["input_tokens"] += r.get("input_tokens") or 0
+            d["output_tokens"] += r.get("output_tokens") or 0
+            d["cache_read_tokens"] += r.get("cache_read_tokens") or 0
+            d["cache_write_tokens"] += r.get("cache_write_tokens") or 0
+            d["total_tokens"] += r.get("total_tokens") or 0
+            if (r.get("cost_status") or "") == "unknown":
+                d["unknown_cost_calls"] += 1
+            else:
+                d["estimated_cost"] += r.get("estimated_cost_usd") or 0.0
+            d["tasks"][r.get("task") or "unknown"] += 1
+            d["categories"][r.get("category") or "unknown"] += 1
+
+        result = []
+        for model, data in grouped.items():
+            tasks = data.pop("tasks")
+            categories = data.pop("categories")
+            top_task = tasks.most_common(1)[0][0] if tasks else "unknown"
+            result.append({
+                "model": model,
+                "top_task": top_task,
+                "tasks": dict(tasks),
+                "categories": dict(categories),
+                **data,
+            })
+        result.sort(key=lambda x: (x["estimated_cost"], x["total_tokens"]), reverse=True)
+        return result
+
+    def _compute_usage_by_day(self, rows: List[Dict]) -> List[Dict]:
+        grouped = defaultdict(lambda: {
+            "calls": 0,
+            "events": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost": 0.0,
+            "unknown_cost_calls": 0,
+        })
+        for r in rows:
+            ts = r.get("timestamp") or 0
+            day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else "unknown"
+            model = _display_model(r.get("model"))
+            key = (day, model)
+            d = grouped[key]
+            d["calls"] += r.get("calls") or 1
+            d["events"] += 1
+            d["input_tokens"] += r.get("input_tokens") or 0
+            d["output_tokens"] += r.get("output_tokens") or 0
+            d["cache_read_tokens"] += r.get("cache_read_tokens") or 0
+            d["cache_write_tokens"] += r.get("cache_write_tokens") or 0
+            d["total_tokens"] += r.get("total_tokens") or 0
+            if (r.get("cost_status") or "") == "unknown":
+                d["unknown_cost_calls"] += 1
+            else:
+                d["estimated_cost"] += r.get("estimated_cost_usd") or 0.0
+
+        result = [
+            {"date": day, "model": model, **data}
+            for (day, model), data in grouped.items()
+        ]
+        result.sort(key=lambda x: (x["date"], x["estimated_cost"], x["total_tokens"]), reverse=True)
+        return result
+
     def _compute_tool_breakdown(self, tool_usage: List[Dict]) -> List[Dict]:
         """Process tool usage data into a ranked list with percentages."""
         total_calls = sum(t["count"] for t in tool_usage) if tool_usage else 0
@@ -863,6 +1122,59 @@ class InsightsEngine:
 
         return "\n".join(lines)
 
+    def format_usage_terminal(self, report: Dict) -> str:
+        """Format the model-centric usage report for terminal display."""
+        days = report.get("days", 30)
+        filters = report.get("model_filter") or []
+        src = f" source={report['source_filter']}" if report.get("source_filter") else ""
+        model_suffix = f" model={','.join(filters)}" if filters else ""
+        if report.get("empty"):
+            return f"  No LLM usage found in the last {days} days{src}{model_suffix}."
+
+        s = report["summary"]
+        lines = [
+            "",
+            "  LLM Usage",
+            "  " + "─" * 56,
+            f"  Period:            Last {days} days{src}{model_suffix}",
+            f"  Calls:             {s['calls']:,} ({s['events']:,} ledger rows)",
+            f"  Main rows:         {s['main_events']:,}            Auxiliary rows: {s['auxiliary_events']:,}",
+            f"  Input tokens:      {s['input_tokens']:,}            Output tokens: {s['output_tokens']:,}",
+            f"  Total tokens:      {s['total_tokens']:,}",
+            f"  Estimated cost:    ${s['estimated_cost']:.4f}",
+        ]
+        if s.get("unknown_cost_calls"):
+            lines.append(f"  Unknown pricing:   {s['unknown_cost_calls']:,} calls/rows excluded from cost")
+        lines.append("")
+
+        if report.get("models"):
+            lines.append("  By Model")
+            lines.append("  " + "─" * 56)
+            lines.append(f"  {'Model':<30} {'Calls':>7} {'Tokens':>12} {'Cost':>10}")
+            for m in report["models"]:
+                unknown = " *" if m.get("unknown_cost_calls") else ""
+                lines.append(
+                    f"  {m['model'][:30]:<30} {m['calls']:>7,} "
+                    f"{m['total_tokens']:>12,} ${m['estimated_cost']:>8.4f}{unknown}"
+                )
+            if any(m.get("unknown_cost_calls") for m in report["models"]):
+                lines.append("  * Some calls have unknown pricing and are excluded from cost.")
+            lines.append("")
+
+        if report.get("daily"):
+            lines.append("  By Day")
+            lines.append("  " + "─" * 56)
+            lines.append(f"  {'Date':<12} {'Model':<24} {'Calls':>7} {'Tokens':>12} {'Cost':>10}")
+            for d in report["daily"]:
+                unknown = " *" if d.get("unknown_cost_calls") else ""
+                lines.append(
+                    f"  {d['date']:<12} {d['model'][:24]:<24} {d['calls']:>7,} "
+                    f"{d['total_tokens']:>12,} ${d['estimated_cost']:>8.4f}{unknown}"
+                )
+            lines.append("")
+
+        return "\n".join(lines)
+
     def format_gateway(self, report: Dict) -> str:
         """Format the insights report for gateway/messaging (shorter)."""
         if report.get("empty"):
@@ -927,4 +1239,45 @@ class InsightsEngine:
             if act.get("max_streak", 0) > 1:
                 lines.append(f"**Best streak:** {act['max_streak']} consecutive days")
 
+        return "\n".join(lines)
+
+    def format_usage_gateway(self, report: Dict) -> str:
+        """Format the model-centric usage report for messaging gateways."""
+        days = report.get("days", 30)
+        filters = report.get("model_filter") or []
+        filter_bits = []
+        if report.get("source_filter"):
+            filter_bits.append(f"source={report['source_filter']}")
+        if filters:
+            filter_bits.append(f"model={','.join(filters)}")
+        suffix = f" ({'; '.join(filter_bits)})" if filter_bits else ""
+        if report.get("empty"):
+            return f"No LLM usage found in the last {days} days{suffix}."
+
+        s = report["summary"]
+        lines = [
+            f"📊 **LLM usage** — Last {days} days{suffix}",
+            f"**Total:** {s['calls']:,} calls, {s['total_tokens']:,} tokens, ~${s['estimated_cost']:.4f}",
+        ]
+        if s.get("unknown_cost_calls"):
+            lines.append(f"**Unknown pricing:** {s['unknown_cost_calls']:,} calls/rows excluded from cost")
+        lines.append("")
+
+        lines.append("**By model:**")
+        for m in report.get("models", [])[:10]:
+            unknown = " *" if m.get("unknown_cost_calls") else ""
+            lines.append(
+                f"  {m['model'][:32]} — {m['calls']:,} calls, "
+                f"{m['total_tokens']:,} tokens, ~${m['estimated_cost']:.4f}{unknown}"
+            )
+
+        if report.get("daily"):
+            lines.append("")
+            lines.append("**By day:**")
+            for d in report["daily"][:20]:
+                unknown = " *" if d.get("unknown_cost_calls") else ""
+                lines.append(
+                    f"  {d['date']} {d['model'][:24]} — {d['calls']:,} calls, "
+                    f"{d['total_tokens']:,} tokens, ~${d['estimated_cost']:.4f}{unknown}"
+                )
         return "\n".join(lines)
