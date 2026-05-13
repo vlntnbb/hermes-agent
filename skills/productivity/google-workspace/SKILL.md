@@ -1,7 +1,7 @@
 ---
 name: google-workspace
 description: "Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python."
-version: 1.1.0
+version: 1.2.0
 author: Nous Research
 license: MIT
 platforms: [linux, macos, windows]
@@ -30,6 +30,34 @@ Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OA
 - `scripts/setup.py` — OAuth2 setup (run once to authorize)
 - `scripts/google_api.py` — compatibility wrapper CLI. It prefers `gws` for operations when available, while preserving Hermes' existing JSON output contract.
 
+## Multi-Account OAuth
+
+Hermes supports multiple Google OAuth identities in one profile. Use
+`--account user@example.com` during setup and API calls to bind credentials to a
+named account. Named account files live under:
+
+```text
+~/.hermes/google/accounts/user@example.com/google_client_secret.json
+~/.hermes/google/accounts/user@example.com/google_token.json
+```
+
+The legacy files in `~/.hermes/google_client_secret.json` and
+`~/.hermes/google_token.json` still work as a backward-compatible fallback. To
+copy an existing legacy authorization into the named-account layout:
+
+```bash
+python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/setup.py --migrate-legacy user@example.com --make-default
+```
+
+To switch the default account:
+
+```bash
+python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/scripts/setup.py --set-default-account user@example.com
+```
+
+For one-off commands, either pass `--account user@example.com` or set
+`HERMES_GOOGLE_ACCOUNT=user@example.com`.
+
 ## First-Time Setup
 
 The setup is fully non-interactive — you drive it step by step so it works
@@ -45,6 +73,7 @@ GSETUP="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspac
 
 ```bash
 $GSETUP --check
+$GSETUP --check --account user@example.com
 ```
 
 If it prints `AUTHENTICATED`, skip to Usage — setup is already done.
@@ -61,15 +90,12 @@ Calendar/Drive/Sheets/Docs?"**
   Passwords) and takes 2 minutes to set up. No Google Cloud project needed.
   Load the himalaya skill and follow its setup instructions.
 
-- **Email + Calendar** → Continue with this skill, but use
-  `--services email,calendar` during auth so the consent screen only asks for
-  the scopes they actually need.
+- **Email + Calendar** → Continue with this skill.
 
-- **Calendar/Drive/Sheets/Docs only** → Continue with this skill and use a
-  narrower `--services` set like `calendar,drive,sheets,docs`.
+- **Calendar/Drive/Sheets/Docs only** → Continue with this skill.
 
 - **Full Workspace access** → Continue with this skill and use the default
-  `all` service set.
+  scope set.
 
 **Question 2: "Does your Google account use Advanced Protection (hardware
 security keys required to sign in)? If you're not sure, you probably don't
@@ -106,7 +132,7 @@ Tell the user:
 Once they provide the path:
 
 ```bash
-$GSETUP --client-secret /path/to/client_secret.json
+$GSETUP --client-secret /path/to/client_secret.json --account user@example.com
 ```
 
 If they paste the raw client ID / client secret values instead of a file path,
@@ -116,19 +142,16 @@ explicit (for example `~/Downloads/hermes-google-client-secret.json`), then run
 
 ### Step 3: Get authorization URL
 
-Use the service set chosen in Step 1. Examples:
+Print the authorization URL:
 
 ```bash
-$GSETUP --auth-url --services email,calendar --format json
-$GSETUP --auth-url --services calendar,drive,sheets,docs --format json
-$GSETUP --auth-url --services all --format json
+$GSETUP --auth-url --account user@example.com
 ```
 
-This returns JSON with an `auth_url` field and also saves the exact URL to
-`~/.hermes/google_oauth_last_url.txt`.
+This prints the exact OAuth URL.
 
 Agent rules for this step:
-- Extract the `auth_url` field and send that exact URL to the user as a single line.
+- Send that exact URL to the user as a single line.
 - Tell the user that the browser will likely fail on `http://localhost:1` after approval, and that this is expected.
 - Tell them to copy the ENTIRE redirected URL from the browser address bar.
 - If the user gets `Error 403: access_denied`, send them directly to `https://console.cloud.google.com/auth/audience` to add themselves as a test user.
@@ -141,7 +164,7 @@ pending OAuth session locally so `--auth-code` can complete the PKCE exchange
 later, even on headless systems:
 
 ```bash
-$GSETUP --auth-code "THE_URL_OR_CODE_THE_USER_PASTED" --format json
+$GSETUP --auth-code "THE_URL_OR_CODE_THE_USER_PASTED" --account user@example.com --make-default
 ```
 
 If `--auth-code` fails because the code expired, was already used, or came from
@@ -159,9 +182,9 @@ Should print `AUTHENTICATED`. Setup is complete — token refreshes automaticall
 
 ### Notes
 
-- Token is stored at `~/.hermes/google_token.json` and auto-refreshes.
-- Pending OAuth session state/verifier are stored temporarily at `~/.hermes/google_oauth_pending.json` until exchange completes.
-- If `gws` is installed, `google_api.py` points it at the same `~/.hermes/google_token.json` credentials file. Users do not need to run a separate `gws auth login` flow.
+- Legacy token is stored at `~/.hermes/google_token.json`; named-account tokens are stored under `~/.hermes/google/accounts/<account>/google_token.json`. Tokens auto-refresh.
+- Pending OAuth session state/verifier are stored next to the selected token until exchange completes.
+- If `gws` is installed, `google_api.py` points it at the selected account credentials file. Users do not need to run a separate `gws auth login` flow.
 - To revoke: `$GSETUP --revoke`
 
 ## Usage
@@ -177,6 +200,7 @@ GAPI="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/
 ```bash
 # Search (returns JSON array with id, from, subject, date, snippet)
 $GAPI gmail search "is:unread" --max 10
+$GAPI --account user@example.com gmail search "is:unread" --max 10
 $GAPI gmail search "from:boss@company.com newer_than:1d"
 $GAPI gmail search "has:attachment filename:pdf newer_than:7d"
 

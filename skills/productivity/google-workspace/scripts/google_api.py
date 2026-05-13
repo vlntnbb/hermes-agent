@@ -36,11 +36,13 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+from _google_accounts import resolve_google_account_paths, write_account_metadata
 from _hermes_home import get_hermes_home
 
 HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
+_ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(home=HERMES_HOME)
+TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
+CLIENT_SECRET_PATH = _ACTIVE_ACCOUNT_PATHS.client_secret_path
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -52,6 +54,15 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents",
 ]
+
+
+def configure_account(account: str | None = None):
+    """Select which account-scoped Google token this process should use."""
+    global _ACTIVE_ACCOUNT_PATHS, TOKEN_PATH, CLIENT_SECRET_PATH
+    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account, home=HERMES_HOME)
+    TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
+    CLIENT_SECRET_PATH = _ACTIVE_ACCOUNT_PATHS.client_secret_path
+    return _ACTIVE_ACCOUNT_PATHS
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -184,12 +195,14 @@ def get_credentials():
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
+        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         TOKEN_PATH.write_text(
             json.dumps(
                 _normalize_authorized_user_payload(json.loads(creds.to_json())),
                 indent=2,
             )
         )
+        write_account_metadata(_ACTIVE_ACCOUNT_PATHS)
     if not creds.valid:
         print("Token is invalid. Re-run setup.", file=sys.stderr)
         sys.exit(1)
@@ -1047,8 +1060,37 @@ def _docs_insert_text(doc_id: str, text: str, index: int) -> None:
 # =========================================================================
 
 
+def _pop_account_arg(argv: list[str]) -> tuple[str | None, list[str]]:
+    account = None
+    remaining: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--account":
+            if i + 1 >= len(argv):
+                print("ERROR: --account requires an email/account value.", file=sys.stderr)
+                sys.exit(2)
+            account = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--account="):
+            account = arg.split("=", 1)[1]
+            i += 1
+            continue
+        remaining.append(arg)
+        i += 1
+    return account, remaining
+
+
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace API for Hermes Agent")
+    parser.add_argument(
+        "--account",
+        help=(
+            "Google account email to use. This option may appear before or after "
+            "the service command."
+        ),
+    )
     sub = parser.add_subparsers(dest="service", required=True)
 
     # --- Gmail ---
@@ -1213,7 +1255,9 @@ def main():
     p.add_argument("--text", required=True, help="Text to append to the end of the document")
     p.set_defaults(func=docs_append)
 
-    args = parser.parse_args()
+    account, argv = _pop_account_arg(sys.argv[1:])
+    configure_account(account)
+    args = parser.parse_args(argv)
     args.func(args)
 
 

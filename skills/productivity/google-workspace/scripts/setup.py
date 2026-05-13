@@ -35,12 +35,20 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from _hermes_home import display_hermes_home, get_hermes_home
+from _google_accounts import (
+    list_google_accounts,
+    migrate_legacy_account,
+    resolve_google_account_paths,
+    set_default_account,
+    write_account_metadata,
+)
+from _hermes_home import get_hermes_home
 
 HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
-PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
+_ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(home=HERMES_HOME)
+TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
+CLIENT_SECRET_PATH = _ACTIVE_ACCOUNT_PATHS.client_secret_path
+PENDING_AUTH_PATH = _ACTIVE_ACCOUNT_PATHS.pending_auth_path
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -59,6 +67,16 @@ REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google
 # Google deprecated OOB, so we use a localhost redirect and tell the user to
 # copy the code from the browser's URL bar (or the page body).
 REDIRECT_URI = "http://localhost:1"
+
+
+def select_google_account(account: str | None = None):
+    """Select the Google account path set for this process."""
+    global _ACTIVE_ACCOUNT_PATHS, TOKEN_PATH, CLIENT_SECRET_PATH, PENDING_AUTH_PATH
+    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account, home=HERMES_HOME)
+    TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
+    CLIENT_SECRET_PATH = _ACTIVE_ACCOUNT_PATHS.client_secret_path
+    PENDING_AUTH_PATH = _ACTIVE_ACCOUNT_PATHS.pending_auth_path
+    return _ACTIVE_ACCOUNT_PATHS
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -244,12 +262,19 @@ def store_client_secret(path: str):
         print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
         sys.exit(1)
 
+    CLIENT_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
     CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2))
+    try:
+        CLIENT_SECRET_PATH.chmod(0o600)
+    except OSError:
+        pass
+    write_account_metadata(_ACTIVE_ACCOUNT_PATHS)
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
 def _save_pending_auth(*, state: str, code_verifier: str):
     """Persist the OAuth session bits needed for a later token exchange."""
+    PENDING_AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
     PENDING_AUTH_PATH.write_text(
         json.dumps(
             {
@@ -384,10 +409,18 @@ def exchange_auth_code(code: str):
         print(f"WARNING: Token missing some Google Workspace scopes: {', '.join(missing_scopes)}")
         print("Some services may not be available.")
 
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_PATH.write_text(json.dumps(token_payload, indent=2))
+    try:
+        TOKEN_PATH.chmod(0o600)
+    except OSError:
+        pass
+    write_account_metadata(_ACTIVE_ACCOUNT_PATHS)
     PENDING_AUTH_PATH.unlink(missing_ok=True)
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
-    print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
+    if _ACTIVE_ACCOUNT_PATHS.account:
+        print(f"Google account: {_ACTIVE_ACCOUNT_PATHS.account}")
+    print(f"Profile-scoped token location: {TOKEN_PATH}")
 
 
 def revoke():
@@ -424,6 +457,18 @@ def revoke():
 
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace OAuth setup for Hermes")
+    parser.add_argument(
+        "--account",
+        help=(
+            "Google account email to use. Named accounts store credentials under "
+            "~/.hermes/google/accounts/<account>/ instead of the legacy profile root."
+        ),
+    )
+    parser.add_argument(
+        "--make-default",
+        action="store_true",
+        help="Make the selected or migrated account the default for future Google Workspace commands.",
+    )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="Check if auth is valid (exit 0=yes, 1=no)")
     group.add_argument("--check-live", action="store_true", help="Check auth with a real API call (detects disabled_client)")
@@ -432,7 +477,50 @@ def main():
     group.add_argument("--auth-code", metavar="CODE", help="Exchange auth code for token")
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
+    group.add_argument("--list-accounts", action="store_true", help="List configured Google OAuth accounts")
+    group.add_argument("--set-default-account", metavar="ACCOUNT", help="Set the default Google OAuth account")
+    group.add_argument(
+        "--migrate-legacy",
+        metavar="ACCOUNT",
+        help="Copy legacy profile-root Google credentials into a named account.",
+    )
     args = parser.parse_args()
+
+    if args.list_accounts:
+        accounts = list_google_accounts(HERMES_HOME)
+        if not accounts:
+            print("No Google Workspace accounts configured.")
+            return
+        for account in accounts:
+            marker = "*" if account["default"] else " "
+            print(
+                f"{marker} {account['account']} "
+                f"token={'yes' if account['token'] else 'no'} "
+                f"client_secret={'yes' if account['client_secret'] else 'no'} "
+                f"path={account['path']}"
+            )
+        return
+
+    if args.set_default_account:
+        paths = set_default_account(args.set_default_account, home=HERMES_HOME)
+        print(f"OK: Default Google account set to {paths.account}")
+        return
+
+    if args.migrate_legacy:
+        paths = migrate_legacy_account(
+            args.migrate_legacy,
+            home=HERMES_HOME,
+            make_default=args.make_default,
+        )
+        suffix = " and made default" if args.make_default else ""
+        print(f"OK: Legacy Google credentials copied to {paths.root}{suffix}.")
+        return
+
+    select_google_account(args.account)
+    if args.make_default:
+        if not _ACTIVE_ACCOUNT_PATHS.account:
+            print("ERROR: --make-default requires --account ACCOUNT.")
+            sys.exit(1)
 
     if args.check:
         sys.exit(0 if check_auth() else 1)
@@ -440,10 +528,14 @@ def main():
         sys.exit(0 if check_auth_live() else 1)
     elif args.client_secret:
         store_client_secret(args.client_secret)
+        if args.make_default:
+            set_default_account(_ACTIVE_ACCOUNT_PATHS.account, home=HERMES_HOME)
     elif args.auth_url:
         get_auth_url()
     elif args.auth_code:
         exchange_auth_code(args.auth_code)
+        if args.make_default:
+            set_default_account(_ACTIVE_ACCOUNT_PATHS.account, home=HERMES_HOME)
     elif args.revoke:
         revoke()
     elif args.install_deps:
