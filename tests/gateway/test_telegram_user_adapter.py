@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
+from gateway.session import SessionSource
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 _mod = load_plugin_adapter("telegram_user")
@@ -87,6 +89,8 @@ class _FakeClient:
     def __init__(self):
         self.sent = []
         self.edited = []
+        self.entities = {}
+        self.requests = []
 
     async def send_message(self, entity, message, **kwargs):
         self.sent.append((entity, message, kwargs))
@@ -95,6 +99,14 @@ class _FakeClient:
     async def edit_message(self, entity, message_id, text, **kwargs):
         self.edited.append((entity, message_id, text, kwargs))
         return SimpleNamespace(id=message_id)
+
+    async def get_entity(self, entity):
+        key = str(entity).lower()
+        return self.entities.get(key, SimpleNamespace(id=123, username=str(entity).lstrip("@"), title="Entity"))
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        return SimpleNamespace(chats=[SimpleNamespace(id=789, username="", title="Private Channel")])
 
 
 def _make_adapter(extra=None) -> TelegramUserAdapter:
@@ -280,10 +292,94 @@ async def test_edit_message_uses_telethon_edit_message():
     ]
 
 
+def test_subscription_store_round_trips(monkeypatch, tmp_path):
+    store_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(_mod, "_subscription_store_path", lambda: store_path)
+
+    adapter = _make_adapter()
+    item = adapter._subscription_record(
+        entity=SimpleNamespace(id=42, username="news", title="News", broadcast=True),
+        target="@news",
+        kind="channel",
+        mode="notify",
+    )
+
+    assert item["key"] == "@news"
+    assert item["mode"] == "notify"
+    assert _mod._find_subscription_item("@news")[1]["title"] == "News"
+
+
+@pytest.mark.asyncio
+async def test_subscription_inbound_notify_does_not_dispatch_to_agent(monkeypatch, tmp_path):
+    store_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(_mod, "_subscription_store_path", lambda: store_path)
+
+    adapter = _make_adapter({"home_channel": {"chat_id": "973126834"}})
+    adapter._client = _FakeClient()
+    adapter.send_interval_seconds = 0
+    adapter._subscription_record(
+        entity=SimpleNamespace(id=123, username="news", title="News", broadcast=True),
+        target="@news",
+        kind="channel",
+        mode="notify",
+    )
+    adapter.handle_message = AsyncMock()
+
+    event = _FakeEvent(chat_id=123, sender_id=123, text="breaking", is_private=False, is_channel=True)
+    event._chat = SimpleNamespace(id=123, title="News", username="news", broadcast=True)
+    event._sender = SimpleNamespace(id=123, title="News", username="news")
+
+    await adapter._handle_new_message(event)
+
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._client.sent[0][0] == 973126834
+    assert "breaking" in adapter._client.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_tg_sub_hook_uses_live_adapter_and_replies(monkeypatch, tmp_path):
+    store_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(_mod, "_subscription_store_path", lambda: store_path)
+
+    manager = _make_adapter()
+    manager.subscribe_public_channel = AsyncMock(
+        return_value={"success": True, "item": {"username": "@news", "mode": "notify"}}
+    )
+    response_adapter = SimpleNamespace(send=AsyncMock())
+    gateway = SimpleNamespace(
+        adapters={Platform("telegram_user"): manager, Platform.TELEGRAM: response_adapter},
+        _is_user_authorized=lambda _source: True,
+    )
+    event = MessageEvent(
+        text="/tg-sub add @news --mode notify",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="973126834",
+            user_id="973126834",
+            chat_type="dm",
+        ),
+    )
+
+    result = await _mod._handle_tg_sub_pre_dispatch(event=event, gateway=gateway)
+
+    assert result == {"action": "skip", "reason": "telegram-user-subscription-command"}
+    manager.subscribe_public_channel.assert_awaited_once_with("@news", mode="notify")
+    response_adapter.send.assert_awaited_once()
+    assert "@news" in response_adapter.send.await_args.args[1]
+
+
 def test_register_exposes_platform_entry():
     class Ctx:
         def __init__(self):
             self.kwargs = None
+            self.commands = {}
+            self.hooks = {}
+
+        def register_command(self, name, handler, **kwargs):
+            self.commands[name] = {"handler": handler, **kwargs}
+
+        def register_hook(self, name, handler):
+            self.hooks[name] = handler
 
         def register_platform(self, **kwargs):
             self.kwargs = kwargs
@@ -296,3 +392,5 @@ def test_register_exposes_platform_entry():
     assert ctx.kwargs["allowed_users_env"] == "TELEGRAM_USER_ALLOWED_CHATS"
     assert ctx.kwargs["allow_all_env"] == "TELEGRAM_USER_ALLOW_ALL_CHATS"
     assert callable(ctx.kwargs["standalone_sender_fn"])
+    assert "tg-sub" in ctx.commands
+    assert "pre_gateway_dispatch" in ctx.hooks

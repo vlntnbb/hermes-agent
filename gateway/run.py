@@ -5700,6 +5700,12 @@ class GatewayRunner:
                 _hook_results = []
 
             for _result in _hook_results:
+                if asyncio.iscoroutine(_result):
+                    try:
+                        _result = await _result
+                    except Exception as _hook_exc:
+                        logger.warning("pre_gateway_dispatch async hook failed: %s", _hook_exc)
+                        continue
                 if not isinstance(_result, dict):
                     continue
                 _action = _result.get("action")

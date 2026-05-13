@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
+import shlex
 import time
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +54,7 @@ from gateway.platforms.base import (
     utf16_len,
 )
 from hermes_constants import get_config_path, get_hermes_home
+from utils import atomic_replace
 
 logger = logging.getLogger("gateway.platforms.telegram_user")
 
@@ -65,6 +68,8 @@ events: Any = None
 StringSession: Any = None
 SessionPasswordNeededError: Any = None
 RPCError: Any = None
+
+SUBSCRIPTION_MODES = {"silent", "notify", "digest"}
 
 
 def _load_telethon() -> bool:
@@ -188,6 +193,129 @@ def _ensure_private_parent(path: Path) -> None:
 
 def _safe_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _subscription_store_path() -> Path:
+    return get_hermes_home() / "platforms" / "telegram_user" / "subscriptions.json"
+
+
+def _empty_subscription_store() -> dict[str, Any]:
+    return {"version": 1, "items": {}}
+
+
+def _load_subscription_store() -> dict[str, Any]:
+    path = _subscription_store_path()
+    if not path.exists():
+        return _empty_subscription_store()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Telegram User: could not read subscription store %s", path)
+        return _empty_subscription_store()
+    if not isinstance(data, dict):
+        return _empty_subscription_store()
+    items = data.get("items")
+    if not isinstance(items, dict):
+        data["items"] = {}
+    data.setdefault("version", 1)
+    return data
+
+
+def _save_subscription_store(data: dict[str, Any]) -> None:
+    path = _subscription_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    atomic_replace(tmp, path)
+
+
+def _normalize_subscription_mode(value: Any, default: str = "silent") -> str:
+    mode = str(value or "").strip().lower() or default
+    if mode not in SUBSCRIPTION_MODES:
+        raise ValueError(f"mode must be one of: {', '.join(sorted(SUBSCRIPTION_MODES))}")
+    return mode
+
+
+def _normalize_public_target(target: str) -> str:
+    raw = str(target or "").strip()
+    match = re.match(r"^https?://t\.me/([A-Za-z0-9_]{5,})/?$", raw)
+    if match:
+        return f"@{match.group(1)}"
+    return raw
+
+
+def _extract_invite_hash(target: str) -> Optional[str]:
+    raw = str(target or "").strip()
+    patterns = (
+        r"^https?://t\.me/\+([A-Za-z0-9_-]+)$",
+        r"^https?://t\.me/joinchat/([A-Za-z0-9_-]+)$",
+        r"^t\.me/\+([A-Za-z0-9_-]+)$",
+        r"^t\.me/joinchat/([A-Za-z0-9_-]+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, raw)
+        if match:
+            return match.group(1)
+    if raw.startswith("+") and len(raw) > 1:
+        return raw[1:]
+    return None
+
+
+def _entity_username(entity: Any) -> str:
+    username = str(getattr(entity, "username", "") or "").strip()
+    return f"@{username.lower()}" if username else ""
+
+
+def _entity_title(entity: Any) -> str:
+    return _display_name(entity) or _entity_username(entity) or str(getattr(entity, "id", "") or "")
+
+
+def _subscription_key_for_entity(entity: Any, fallback: str) -> str:
+    username = _entity_username(entity)
+    if username:
+        return username
+    entity_id = str(getattr(entity, "id", "") or "").strip()
+    if entity_id:
+        return entity_id
+    return _normalize_identifier(fallback)
+
+
+def _subscription_item_variants(item: dict[str, Any]) -> set[str]:
+    variants: set[str] = set()
+    for key in ("key", "target", "peer_id", "username", "title"):
+        variants.update(_identifier_variants(item.get(key)))
+    return variants
+
+
+def _find_subscription_item(target: str) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    lookup = _identifier_variants(target)
+    data = _load_subscription_store()
+    for key, item in data.get("items", {}).items():
+        if not isinstance(item, dict):
+            continue
+        if lookup & (_identifier_variants(key) | _subscription_item_variants(item)):
+            return key, item
+    return None, None
+
+
+def _format_subscription_item(item: dict[str, Any]) -> str:
+    label = item.get("username") or item.get("title") or item.get("target") or item.get("key")
+    mode = item.get("mode", "silent")
+    kind = item.get("kind", "chat")
+    pending = int(item.get("pending_count") or 0)
+    suffix = f", pending={pending}" if pending else ""
+    return f"- {label} ({kind}, {mode}{suffix})"
 
 
 def _load_config_platform_block() -> dict[str, Any]:
@@ -744,6 +872,234 @@ class TelegramUserAdapter(BasePlatformAdapter):
         except Exception:
             return {"name": str(chat_id), "type": "dm", "chat_id": str(chat_id)}
 
+    def _subscription_notice_target(self) -> str:
+        home = os.getenv("TELEGRAM_USER_HOME_CHANNEL", "").strip()
+        if home:
+            return home
+        extra_home = (getattr(self.config, "extra", {}) or {}).get("home_channel")
+        if isinstance(extra_home, dict):
+            return str(extra_home.get("chat_id") or "").strip()
+        return str(extra_home or "").strip()
+
+    def _subscription_for_event(
+        self,
+        event: Any,
+        chat: Any,
+        sender: Any,
+    ) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+        candidates = self._identity_candidates(event, chat, sender)
+        data = _load_subscription_store()
+        for key, item in data.get("items", {}).items():
+            if not isinstance(item, dict):
+                continue
+            if candidates & (_identifier_variants(key) | _subscription_item_variants(item)):
+                return key, item
+        return None, None
+
+    def _save_subscription_item(self, key: str, item: dict[str, Any]) -> None:
+        data = _load_subscription_store()
+        data.setdefault("items", {})[key] = item
+        _save_subscription_store(data)
+
+    def _subscription_record(
+        self,
+        *,
+        entity: Any,
+        target: str,
+        kind: str,
+        mode: str,
+        payload: str = "",
+    ) -> dict[str, Any]:
+        key = _subscription_key_for_entity(entity, target)
+        now = datetime.now().isoformat(timespec="seconds")
+        existing_key, existing = _find_subscription_item(key)
+        item = dict(existing or {})
+        item.update(
+            {
+                "key": existing_key or key,
+                "target": target,
+                "peer_id": str(getattr(entity, "id", "") or ""),
+                "username": _entity_username(entity),
+                "title": _entity_title(entity),
+                "kind": kind,
+                "mode": _normalize_subscription_mode(mode),
+                "payload": payload,
+                "updated_at": now,
+            }
+        )
+        item.setdefault("created_at", now)
+        item.setdefault("pending_count", 0)
+        self._save_subscription_item(str(item["key"]), item)
+        return item
+
+    async def subscribe_public_channel(self, target: str, mode: str = "silent") -> dict[str, Any]:
+        if not self._client:
+            return {"error": "Telegram User adapter is not connected"}
+        if not target.strip():
+            return {"error": "Usage: /tg-sub add <@channel-or-t.me-link> [--mode silent|notify|digest]"}
+        if _extract_invite_hash(target):
+            return {"error": "Invite links must use: /tg-sub join <invite-link>"}
+        if not _load_telethon():
+            return {"error": "Telethon is not installed"}
+        from telethon.tl.functions.channels import JoinChannelRequest
+
+        normalized = _normalize_public_target(target)
+        try:
+            entity = await self._client.get_entity(normalized)
+            try:
+                await self._client(JoinChannelRequest(entity))
+            except Exception as exc:
+                if "already" not in str(exc).lower():
+                    raise
+            entity = await self._client.get_entity(normalized)
+            item = self._subscription_record(
+                entity=entity,
+                target=normalized,
+                kind=self._chat_type_from_entity(entity),
+                mode=mode,
+            )
+            return {"success": True, "item": item}
+        except Exception as exc:
+            return {"error": f"Telegram join failed: {exc}"}
+
+    async def join_private_invite(self, invite_link: str, mode: str = "silent") -> dict[str, Any]:
+        if not self._client:
+            return {"error": "Telegram User adapter is not connected"}
+        invite_hash = _extract_invite_hash(invite_link)
+        if not invite_hash:
+            return {"error": "Usage: /tg-sub join <https://t.me/+invitehash> [--mode silent|notify|digest]"}
+        if not _load_telethon():
+            return {"error": "Telethon is not installed"}
+        from telethon.tl.functions.messages import ImportChatInviteRequest
+
+        try:
+            result = await self._client(ImportChatInviteRequest(invite_hash))
+            chats = list(getattr(result, "chats", None) or [])
+            entity = chats[0] if chats else None
+            if entity is None:
+                return {"error": "Telegram accepted the invite but did not return a chat entity"}
+            item = self._subscription_record(
+                entity=entity,
+                target=invite_link,
+                kind=self._chat_type_from_entity(entity),
+                mode=mode,
+            )
+            return {"success": True, "item": item}
+        except Exception as exc:
+            if "already" in str(exc).lower():
+                return {"error": "Already joined; use /tg-sub add @username if the chat has a public username."}
+            return {"error": f"Telegram invite join failed: {exc}"}
+
+    async def start_bot_subscription(
+        self,
+        bot_target: str,
+        payload: str = "",
+        mode: str = "notify",
+    ) -> dict[str, Any]:
+        if not self._client:
+            return {"error": "Telegram User adapter is not connected"}
+        if not bot_target.strip():
+            return {"error": "Usage: /tg-sub bot <@bot> [payload] [--mode silent|notify|digest]"}
+        if not _load_telethon():
+            return {"error": "Telethon is not installed"}
+        from telethon.tl.functions.messages import StartBotRequest
+
+        normalized = _normalize_public_target(bot_target)
+        try:
+            bot = await self._client.get_entity(normalized)
+            await self._client(StartBotRequest(bot=bot, peer=bot, start_param=payload or ""))
+            item = self._subscription_record(
+                entity=bot,
+                target=normalized,
+                kind="bot",
+                mode=mode,
+                payload=payload,
+            )
+            return {"success": True, "item": item}
+        except Exception as exc:
+            return {"error": f"Telegram bot start failed: {exc}"}
+
+    async def unsubscribe_target(self, target: str, *, leave: bool = False) -> dict[str, Any]:
+        key, item = _find_subscription_item(target)
+        if not key or not item:
+            return {"error": f"No Telegram User subscription found for {target}"}
+        if leave:
+            if not self._client:
+                return {"error": "Telegram User adapter is not connected"}
+            try:
+                from telethon.tl.functions.channels import LeaveChannelRequest
+
+                entity_ref = item.get("username") or item.get("peer_id") or item.get("target") or target
+                entity = await self._client.get_entity(entity_ref)
+                if item.get("kind") == "bot":
+                    await self.send(str(entity_ref), "/stop")
+                else:
+                    await self._client(LeaveChannelRequest(entity))
+            except Exception as exc:
+                return {"error": f"Telegram leave failed: {exc}"}
+        data = _load_subscription_store()
+        data.get("items", {}).pop(str(key), None)
+        _save_subscription_store(data)
+        return {"success": True, "item": item}
+
+    async def set_subscription_mode(self, target: str, mode: str) -> dict[str, Any]:
+        key, item = _find_subscription_item(target)
+        if not key or not item:
+            return {"error": f"No Telegram User subscription found for {target}"}
+        try:
+            item["mode"] = _normalize_subscription_mode(mode)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_subscription_item(str(key), item)
+        return {"success": True, "item": item}
+
+    async def send_subscription_message(self, target: str, text: str) -> dict[str, Any]:
+        key, item = _find_subscription_item(target)
+        if not key or not item:
+            return {"error": f"No Telegram User subscription found for {target}"}
+        entity_ref = item.get("username") or item.get("peer_id") or item.get("target") or target
+        result = await self.send(str(entity_ref), text)
+        if result.success:
+            return {"success": True, "item": item, "message_id": result.message_id}
+        return {"error": result.error or "send failed"}
+
+    async def _handle_subscription_message(
+        self,
+        key: str,
+        item: dict[str, Any],
+        event: Any,
+        chat: Any,
+        sender: Any,
+        text: str,
+    ) -> None:
+        mode = str(item.get("mode") or "silent").lower()
+        if mode not in SUBSCRIPTION_MODES:
+            mode = "silent"
+        message = getattr(event, "message", event)
+        item["last_message_id"] = str(getattr(message, "id", "") or "")
+        item["last_seen_at"] = datetime.now().isoformat(timespec="seconds")
+        item["last_text"] = text[:2000]
+        if mode == "digest":
+            item["pending_count"] = int(item.get("pending_count") or 0) + 1
+        self._save_subscription_item(key, item)
+
+        if mode != "notify":
+            return
+        home = self._subscription_notice_target()
+        if not home:
+            logger.info("Telegram User: subscription notification skipped; no home channel configured")
+            return
+        title = item.get("title") or _display_name(chat) or item.get("target") or key
+        sender_label = _display_name(sender)
+        prefix = f"Telegram subscription update from {title}"
+        if sender_label and sender_label != title:
+            prefix += f" ({sender_label})"
+        snippet = text.strip()
+        if len(snippet) > 1200:
+            snippet = snippet[:1197].rstrip() + "..."
+        await self.send(home, f"{prefix}:\n\n{snippet}")
+
     @staticmethod
     def _chat_type_from_event(event: Any, chat: Any = None) -> str:
         if getattr(event, "is_private", False):
@@ -840,6 +1196,10 @@ class TelegramUserAdapter(BasePlatformAdapter):
             sender = await event.get_sender()
             sender_id = str(getattr(sender, "id", "") or getattr(event, "sender_id", "") or "")
             if self.ignore_self_messages and self._account_user_id and sender_id == self._account_user_id:
+                return
+            sub_key, sub_item = self._subscription_for_event(event, chat, sender)
+            if sub_key and sub_item:
+                await self._handle_subscription_message(sub_key, sub_item, event, chat, sender, text)
                 return
             if not self._event_allowed(event, chat, sender):
                 logger.debug("Telegram User: ignoring message from non-allowlisted chat")
@@ -1073,6 +1433,211 @@ async def _standalone_send(
             pass
 
 
+def _tg_sub_usage() -> str:
+    return (
+        "Usage:\n"
+        "/tg-sub add <@channel|https://t.me/name> [--mode silent|notify|digest]\n"
+        "/tg-sub join <https://t.me/+invitehash> [--mode silent|notify|digest]\n"
+        "/tg-sub bot <@bot> [payload] [--mode silent|notify|digest]\n"
+        "/tg-sub send <target> <message>\n"
+        "/tg-sub mode <target> <silent|notify|digest>\n"
+        "/tg-sub list\n"
+        "/tg-sub digest [--clear]\n"
+        "/tg-sub remove <target>\n"
+        "/tg-sub leave <target>"
+    )
+
+
+def _split_tg_sub_args(raw_args: str) -> list[str]:
+    try:
+        return shlex.split(raw_args or "")
+    except ValueError as exc:
+        raise ValueError(f"Could not parse arguments: {exc}") from exc
+
+
+def _pop_mode(tokens: list[str], default: str) -> tuple[list[str], str]:
+    remaining: list[str] = []
+    mode = default
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--mode", "-m"}:
+            if i + 1 >= len(tokens):
+                raise ValueError("--mode requires a value")
+            mode = _normalize_subscription_mode(tokens[i + 1], default)
+            i += 2
+            continue
+        if token.startswith("--mode="):
+            mode = _normalize_subscription_mode(token.split("=", 1)[1], default)
+            i += 1
+            continue
+        remaining.append(token)
+        i += 1
+    return remaining, mode
+
+
+def _format_tg_sub_result(action: str, result: dict[str, Any]) -> str:
+    if result.get("error"):
+        return f"Telegram subscription {action} failed: {result['error']}"
+    item = result.get("item") or {}
+    label = item.get("username") or item.get("title") or item.get("target") or item.get("key")
+    mode = item.get("mode", "silent")
+    return f"Telegram subscription {action}: {label} ({mode})"
+
+
+def _format_tg_sub_list() -> str:
+    items = [
+        item for item in _load_subscription_store().get("items", {}).values()
+        if isinstance(item, dict)
+    ]
+    if not items:
+        return "No Telegram User subscriptions yet."
+    lines = ["Telegram User subscriptions:"]
+    lines.extend(_format_subscription_item(item) for item in sorted(
+        items,
+        key=lambda item: str(item.get("username") or item.get("title") or item.get("target") or ""),
+    ))
+    return "\n".join(lines)
+
+
+def _format_tg_sub_digest(clear: bool = False) -> str:
+    data = _load_subscription_store()
+    rows = []
+    changed = False
+    for key, item in data.get("items", {}).items():
+        if not isinstance(item, dict):
+            continue
+        pending = int(item.get("pending_count") or 0)
+        if pending <= 0:
+            continue
+        label = item.get("username") or item.get("title") or item.get("target") or key
+        text = str(item.get("last_text") or "").strip()
+        if len(text) > 500:
+            text = text[:497].rstrip() + "..."
+        rows.append(f"- {label}: {pending} pending\n  Last: {text or '<no text>'}")
+        if clear:
+            item["pending_count"] = 0
+            changed = True
+    if changed:
+        _save_subscription_store(data)
+    if not rows:
+        return "No pending Telegram subscription digest items."
+    suffix = "\n\nDigest counters cleared." if clear else ""
+    return "Telegram subscription digest:\n" + "\n".join(rows) + suffix
+
+
+async def _handle_tg_sub_command(adapter: TelegramUserAdapter, raw_args: str) -> str:
+    try:
+        tokens = _split_tg_sub_args(raw_args)
+    except ValueError as exc:
+        return str(exc)
+    if not tokens or tokens[0] in {"help", "-h", "--help"}:
+        return _tg_sub_usage()
+
+    action = tokens[0].lower()
+    args = tokens[1:]
+
+    try:
+        if action in {"list", "ls"}:
+            return _format_tg_sub_list()
+        if action == "digest":
+            return _format_tg_sub_digest(clear="--clear" in args)
+        if action in {"add", "subscribe"}:
+            args, mode = _pop_mode(args, "silent")
+            if not args:
+                return "Usage: /tg-sub add <@channel|https://t.me/name> [--mode silent|notify|digest]"
+            return _format_tg_sub_result(
+                "added",
+                await adapter.subscribe_public_channel(args[0], mode=mode),
+            )
+        if action == "join":
+            args, mode = _pop_mode(args, "silent")
+            if not args:
+                return "Usage: /tg-sub join <https://t.me/+invitehash> [--mode silent|notify|digest]"
+            return _format_tg_sub_result(
+                "joined",
+                await adapter.join_private_invite(args[0], mode=mode),
+            )
+        if action in {"bot", "start-bot", "startbot"}:
+            args, mode = _pop_mode(args, "notify")
+            if not args:
+                return "Usage: /tg-sub bot <@bot> [payload] [--mode silent|notify|digest]"
+            target = args[0]
+            payload = " ".join(args[1:]).strip()
+            return _format_tg_sub_result(
+                "bot started",
+                await adapter.start_bot_subscription(target, payload=payload, mode=mode),
+            )
+        if action == "send":
+            if len(args) < 2:
+                return "Usage: /tg-sub send <target> <message>"
+            return _format_tg_sub_result(
+                "message sent to",
+                await adapter.send_subscription_message(args[0], " ".join(args[1:])),
+            )
+        if action == "mode":
+            if len(args) != 2:
+                return "Usage: /tg-sub mode <target> <silent|notify|digest>"
+            return _format_tg_sub_result(
+                "mode updated for",
+                await adapter.set_subscription_mode(args[0], args[1]),
+            )
+        if action in {"remove", "rm", "unsubscribe"}:
+            if len(args) != 1:
+                return "Usage: /tg-sub remove <target>"
+            return _format_tg_sub_result(
+                "removed",
+                await adapter.unsubscribe_target(args[0], leave=False),
+            )
+        if action == "leave":
+            if len(args) != 1:
+                return "Usage: /tg-sub leave <target>"
+            return _format_tg_sub_result(
+                "left",
+                await adapter.unsubscribe_target(args[0], leave=True),
+            )
+    except ValueError as exc:
+        return str(exc)
+
+    return _tg_sub_usage()
+
+
+async def _handle_tg_sub_pre_dispatch(**kwargs: Any) -> Optional[dict[str, str]]:
+    event = kwargs.get("event")
+    gateway = kwargs.get("gateway")
+    if event is None or gateway is None:
+        return None
+    command = event.get_command() if hasattr(event, "get_command") else None
+    if command not in {"tg-sub", "tg_sub"}:
+        return None
+
+    source = getattr(event, "source", None)
+    if source is None:
+        return {"action": "skip", "reason": "telegram-user-subscription-missing-source"}
+    try:
+        if not gateway._is_user_authorized(source):  # noqa: SLF001 - gateway owns auth policy.
+            logger.warning(
+                "Telegram User: unauthorized /tg-sub from user=%s platform=%s",
+                getattr(source, "user_id", None),
+                getattr(getattr(source, "platform", None), "value", None),
+            )
+            return {"action": "skip", "reason": "telegram-user-subscription-unauthorized"}
+    except Exception as exc:
+        logger.warning("Telegram User: could not authorize /tg-sub: %s", exc)
+        return {"action": "skip", "reason": "telegram-user-subscription-auth-error"}
+
+    manager = getattr(gateway, "adapters", {}).get(Platform("telegram_user"))
+    response_adapter = getattr(gateway, "adapters", {}).get(source.platform)
+    if manager is None:
+        response = "Telegram User adapter is not connected."
+    else:
+        response = await _handle_tg_sub_command(manager, event.get_command_args())
+
+    if response_adapter is not None:
+        await response_adapter.send(source.chat_id, response)
+    return {"action": "skip", "reason": "telegram-user-subscription-command"}
+
+
 def interactive_setup() -> None:
     """Interactive gateway setup flow for the Telegram user platform."""
     from hermes_cli.setup import (
@@ -1193,6 +1758,13 @@ def interactive_setup() -> None:
 
 def register(ctx: Any) -> None:
     """Plugin entry point."""
+    ctx.register_command(
+        "tg-sub",
+        lambda _args: _tg_sub_usage(),
+        description="Manage Telegram User channel and bot subscriptions",
+        args_hint="<add|join|bot|list|send|mode|digest|remove|leave>",
+    )
+    ctx.register_hook("pre_gateway_dispatch", _handle_tg_sub_pre_dispatch)
     ctx.register_platform(
         name="telegram_user",
         label="Telegram User",
