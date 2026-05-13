@@ -116,6 +116,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
+    "platform.telegram_user": ("telethon==1.43.0",),
     "platform.discord": ("discord.py[voice]==2.7.1",),
     "platform.slack": (
         "slack-bolt==1.27.0",

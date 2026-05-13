@@ -56,6 +56,7 @@ def _make_runner(platform: Platform):
     runner.pairing_store._is_rate_limited.return_value = False
     runner.session_store = MagicMock()
     runner._running_agents = {}
+    runner._running_agents_task_titles = {}
     runner._update_prompt_pending = {}
     return runner, adapter
 
@@ -112,7 +113,7 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
 async def test_hook_allow_falls_through_to_auth(monkeypatch):
     """A plugin returning {'action': 'allow'} continues to normal dispatch."""
     _clear_auth_env(monkeypatch)
-    # No allowed users set → auth fails → pairing flow triggers.
+    # No allowed users set → auth fails; trigger phrase opens pairing.
     monkeypatch.delenv("WHATSAPP_ALLOWED_USERS", raising=False)
 
     def _fake_hook(name, **kwargs):
@@ -125,7 +126,7 @@ async def test_hook_allow_falls_through_to_auth(monkeypatch):
     runner, adapter = _make_runner(Platform.WHATSAPP)
     runner.pairing_store.generate_code.return_value = "12345"
 
-    result = await runner._handle_message(_make_event("hi"))
+    result = await runner._handle_message(_make_event("симсим откройся"))
 
     # auth chain ran → pairing code was generated
     assert result is None

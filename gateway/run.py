@@ -5620,6 +5620,15 @@ class GatewayRunner:
 
         return "pair"
 
+    def _message_requests_pairing(self, event: MessageEvent) -> bool:
+        """Return True when an unauthorized DM explicitly requests pairing."""
+        phrase = os.getenv("GATEWAY_PAIRING_TRIGGER_PHRASE", "симсим откройся")
+        phrase = str(phrase or "").strip().casefold()
+        if not phrase:
+            return False
+        text = str(getattr(event, "text", "") or "").casefold()
+        return phrase in text
+
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
         adapter = self.adapters.get(source.platform)
@@ -5724,6 +5733,13 @@ class GatewayRunner:
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
+                if not self._message_requests_pairing(event):
+                    logger.info(
+                        "Ignoring unauthorized DM without pairing trigger: user=%s platform=%s",
+                        source.user_id,
+                        source.platform.value if source.platform else "unknown",
+                    )
+                    return None
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when

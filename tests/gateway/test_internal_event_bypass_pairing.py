@@ -352,8 +352,8 @@ async def test_none_user_id_does_not_generate_pairing_code(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp_path):
-    """Verify the normal (non-internal) path still triggers pairing for unknown users."""
+async def test_non_internal_event_with_trigger_phrase_triggers_pairing(monkeypatch, tmp_path):
+    """Verify the normal (non-internal) path can still trigger pairing for unknown users."""
     import gateway.run as gateway_run
     import gateway.pairing as pairing_mod
 
@@ -387,7 +387,7 @@ async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp
     )
     # Normal event (not internal)
     event = MessageEvent(
-        text="hello",
+        text="симсим откройся",
         source=source,
         internal=False,
     )

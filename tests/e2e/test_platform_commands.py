@@ -190,10 +190,10 @@ class TestAuthorization:
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_gets_pairing_response(self, adapter, runner, platform):
-        """Unauthorized DM should trigger pairing code, not a command response."""
+        """Unauthorized DM with the pairing trigger should receive a pairing code."""
         runner._is_user_authorized = lambda _source: False
 
-        event = make_event(platform, "/help")
+        event = make_event(platform, "симсим откройся")
         adapter.send.reset_mock()
         await adapter.handle_message(event)
         await asyncio.sleep(0.3)

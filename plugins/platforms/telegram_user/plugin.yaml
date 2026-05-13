@@ -1,0 +1,56 @@
+name: telegram-user-platform
+label: Telegram User
+kind: platform
+version: 1.0.0
+description: >
+  Telegram user-account gateway adapter for Hermes Agent.
+  Uses Telethon / MTProto with a dedicated Telegram account instead of a bot.
+author: Nous Research
+requires_env:
+  - name: TELEGRAM_USER_API_ID
+    description: "Telegram API ID from https://my.telegram.org/apps"
+    prompt: "Telegram API ID"
+    password: false
+    url: "https://my.telegram.org/apps"
+  - name: TELEGRAM_USER_API_HASH
+    description: "Telegram API hash from https://my.telegram.org/apps"
+    prompt: "Telegram API hash"
+    password: true
+    url: "https://my.telegram.org/apps"
+optional_env:
+  - name: TELEGRAM_USER_SESSION_PATH
+    description: "Telethon session base path (default: ~/.hermes/secrets/telegram_user)"
+    prompt: "Telethon session path"
+    password: false
+  - name: TELEGRAM_USER_SESSION_STRING
+    description: "Telethon StringSession. Treat as full account access."
+    prompt: "Telethon session string"
+    password: true
+  - name: TELEGRAM_USER_PHONE
+    description: "Phone number used by setup login only"
+    prompt: "Telegram phone number"
+    password: false
+  - name: TELEGRAM_USER_ALLOWED_CHATS
+    description: "Comma-separated chat/user IDs or usernames allowed to reach Hermes"
+    prompt: "Allowed Telegram user chats"
+    password: false
+  - name: TELEGRAM_USER_ALLOWED_USERS
+    description: "Optional sender IDs/usernames allowed inside allowed group chats"
+    prompt: "Allowed Telegram senders"
+    password: false
+  - name: TELEGRAM_USER_ALLOW_ALL_CHATS
+    description: "Allow every inbound chat to reach Hermes. Unsafe outside dedicated test accounts."
+    prompt: "Allow all chats? (true/false)"
+    password: false
+  - name: TELEGRAM_USER_REQUIRE_MENTION
+    description: "Require @username/name trigger in groups and channels (default: true)"
+    prompt: "Require group mention? (true/false)"
+    password: false
+  - name: TELEGRAM_USER_HOME_CHANNEL
+    description: "Default chat/user ID for cron and notification delivery"
+    prompt: "Home chat ID"
+    password: false
+  - name: TELEGRAM_USER_SEND_INTERVAL_SECONDS
+    description: "Minimum delay between outbound sends from this adapter (default: 1.0)"
+    prompt: "Send interval seconds"
+    password: false
