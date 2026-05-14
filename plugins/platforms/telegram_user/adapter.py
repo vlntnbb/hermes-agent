@@ -318,6 +318,50 @@ def _format_subscription_item(item: dict[str, Any]) -> str:
     return f"- {label} ({kind}, {mode}{suffix})"
 
 
+def _telegram_user_limassol_air_alert_reason(text: str) -> str:
+    """Return a reason when a Sensors Social Limassol message should alert."""
+    raw = text or ""
+    match = re.search(r"\bmax\s*=\s*(\d+)\b", raw, flags=re.IGNORECASE)
+    if match:
+        try:
+            value = int(match.group(1))
+        except ValueError:
+            value = 0
+        if value >= 100:
+            return f"max={value} (порог 100+)"
+
+    lowered = raw.lower()
+    for keyword in (
+        "unhealthy",
+        "poor air",
+        "bad air",
+        "very bad",
+        "hazardous",
+        "dust storm",
+        "dust pulse",
+        "dust event",
+        "saharan dust",
+        "air quality spike",
+        "pollution spike",
+        "pm2.5 spike",
+        "pm10 spike",
+        "неблагоприят",
+        "плох",
+        "опасн",
+        "пыль",
+        "загрязнен",
+        "загрязнён",
+    ):
+        if keyword in lowered:
+            return f"ключевой сигнал: {keyword}"
+    return ""
+
+
+def _telegram_user_compact_alert_text(text: str, limit: int = 700) -> str:
+    snippet = re.sub(r"\s+", " ", text or "").strip()
+    return snippet if len(snippet) <= limit else snippet[: limit - 1].rstrip() + "…"
+
+
 def _load_config_platform_block() -> dict[str, Any]:
     """Read a lightweight telegram_user platform block from config.yaml."""
     if yaml is None:
@@ -1080,9 +1124,27 @@ class TelegramUserAdapter(BasePlatformAdapter):
         item["last_message_id"] = str(getattr(message, "id", "") or "")
         item["last_seen_at"] = datetime.now().isoformat(timespec="seconds")
         item["last_text"] = text[:2000]
+        alert_filter = str(item.get("alert_filter") or "").strip().lower()
         if mode == "digest":
             item["pending_count"] = int(item.get("pending_count") or 0) + 1
         self._save_subscription_item(key, item)
+
+        if alert_filter == "limassol_air_quality":
+            reason = _telegram_user_limassol_air_alert_reason(text)
+            if not reason:
+                return
+            home = self._subscription_notice_target()
+            if not home:
+                logger.info("Telegram User: filtered subscription alert skipped; no home channel configured")
+                return
+            snippet = _telegram_user_compact_alert_text(text)
+            await self.send(
+                home,
+                "⚠️ Неблагоприятный прогноз/сигнал по воздуху: Лимассол, Кипр\n"
+                f"• {reason}: {snippet}\n"
+                "Источник: @sensors_social_bot",
+            )
+            return
 
         if mode != "notify":
             return

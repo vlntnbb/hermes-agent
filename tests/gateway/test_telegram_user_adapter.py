@@ -309,6 +309,15 @@ def test_subscription_store_round_trips(monkeypatch, tmp_path):
     assert _mod._find_subscription_item("@news")[1]["title"] == "News"
 
 
+def test_limassol_air_alert_reason_detects_threshold_and_keywords():
+    assert _mod._telegram_user_limassol_air_alert_reason("3 sensors, max=157") == "max=157 (порог 100+)"
+    assert _mod._telegram_user_limassol_air_alert_reason("Overnight dust pulse in Limassol").startswith(
+        "ключевой сигнал:"
+    )
+    assert _mod._telegram_user_limassol_air_alert_reason("3 sensors, max=88") == ""
+    assert _mod._telegram_user_limassol_air_alert_reason("Air quality looks normal") == ""
+
+
 @pytest.mark.asyncio
 async def test_subscription_inbound_notify_does_not_dispatch_to_agent(monkeypatch, tmp_path):
     store_path = tmp_path / "subscriptions.json"
@@ -334,6 +343,43 @@ async def test_subscription_inbound_notify_does_not_dispatch_to_agent(monkeypatc
     adapter.handle_message.assert_not_awaited()
     assert adapter._client.sent[0][0] == 973126834
     assert "breaking" in adapter._client.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_subscription_air_filter_sends_only_adverse_alerts(monkeypatch, tmp_path):
+    store_path = tmp_path / "subscriptions.json"
+    monkeypatch.setattr(_mod, "_subscription_store_path", lambda: store_path)
+
+    adapter = _make_adapter({"home_channel": {"chat_id": "973126834"}})
+    adapter._client = _FakeClient()
+    adapter.send_interval_seconds = 0
+    adapter._subscription_record(
+        entity=SimpleNamespace(id=8559673953, username="sensors_social_bot", title="Sensors Social", bot=True),
+        target="@sensors_social_bot",
+        kind="bot",
+        mode="silent",
+    )
+    key, item = _mod._find_subscription_item("@sensors_social_bot")
+    assert key is not None
+    item["alert_filter"] = "limassol_air_quality"
+    adapter._save_subscription_item(key, item)
+    adapter.handle_message = AsyncMock()
+
+    quiet = _FakeEvent(chat_id=8559673953, sender_id=8559673953, text="3 sensors, max=88")
+    quiet._chat = SimpleNamespace(id=8559673953, title="Sensors Social", username="sensors_social_bot", bot=True)
+    quiet._sender = SimpleNamespace(id=8559673953, title="Sensors Social", username="sensors_social_bot", bot=True)
+    await adapter._handle_new_message(quiet)
+
+    adverse = _FakeEvent(chat_id=8559673953, sender_id=8559673953, text="3 sensors, max=157")
+    adverse._chat = SimpleNamespace(id=8559673953, title="Sensors Social", username="sensors_social_bot", bot=True)
+    adverse._sender = SimpleNamespace(id=8559673953, title="Sensors Social", username="sensors_social_bot", bot=True)
+    await adapter._handle_new_message(adverse)
+
+    adapter.handle_message.assert_not_awaited()
+    assert len(adapter._client.sent) == 1
+    assert adapter._client.sent[0][0] == 973126834
+    assert "Лимассол" in adapter._client.sent[0][1]
+    assert "max=157" in adapter._client.sent[0][1]
 
 
 @pytest.mark.asyncio
