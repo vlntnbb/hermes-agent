@@ -240,6 +240,31 @@ CREATE TABLE IF NOT EXISTS messages (
     platform_message_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS llm_usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    session_id TEXT,
+    source TEXT,
+    category TEXT NOT NULL DEFAULT 'auxiliary',
+    task TEXT,
+    provider TEXT,
+    model TEXT,
+    base_url TEXT,
+    api_mode TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    raw_usage TEXT
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -249,6 +274,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_timestamp ON llm_usage_events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage_events(model);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_task ON llm_usage_events(task);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_source ON llm_usage_events(source);
 """
 
 FTS_SQL = """
@@ -861,6 +890,82 @@ class SessionDB:
         )
         def _do(conn):
             conn.execute(sql, params)
+        self._execute_write(_do)
+
+    def record_llm_usage_event(
+        self,
+        *,
+        timestamp: Optional[float] = None,
+        session_id: Optional[str] = None,
+        source: Optional[str] = None,
+        category: str = "auxiliary",
+        task: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_mode: Optional[str] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        total_tokens: Optional[int] = None,
+        estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+        raw_usage: Optional[str] = None,
+    ) -> None:
+        """Append one provider usage record to the LLM usage ledger."""
+        ts = float(timestamp if timestamp is not None else time.time())
+        total = int(
+            total_tokens
+            if total_tokens is not None
+            else (
+                input_tokens
+                + output_tokens
+                + cache_read_tokens
+                + cache_write_tokens
+                + reasoning_tokens
+            )
+        )
+        params = (
+            ts,
+            session_id,
+            source,
+            category or "auxiliary",
+            task,
+            provider,
+            model,
+            base_url,
+            api_mode,
+            int(input_tokens or 0),
+            int(output_tokens or 0),
+            int(cache_read_tokens or 0),
+            int(cache_write_tokens or 0),
+            int(reasoning_tokens or 0),
+            total,
+            estimated_cost_usd,
+            actual_cost_usd,
+            cost_status,
+            cost_source,
+            pricing_version,
+            raw_usage,
+        )
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO llm_usage_events (
+                   timestamp, session_id, source, category, task, provider, model,
+                   base_url, api_mode, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   total_tokens, estimated_cost_usd, actual_cost_usd,
+                   cost_status, cost_source, pricing_version, raw_usage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                params,
+            )
+
         self._execute_write(_do)
 
     def ensure_session(
@@ -3270,4 +3375,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

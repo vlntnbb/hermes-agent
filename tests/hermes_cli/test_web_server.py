@@ -3,6 +3,7 @@
 import os
 import json
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -1027,6 +1028,70 @@ class TestNewEndpoints:
         assert top_skill["manage_count"] == 0
         assert top_skill["total_count"] == 1
         assert top_skill["last_used_at"] is not None
+
+    def test_analytics_usage_includes_auxiliary_spend(self):
+        from hermes_state import SessionDB
+
+        now = time.time()
+        db = SessionDB()
+        try:
+            db.record_llm_usage_event(
+                timestamp=now,
+                session_id="aux-analytics-test",
+                source="cli",
+                category="auxiliary",
+                task="context_compression",
+                provider="google",
+                model="gemini-3.1-pro-preview",
+                input_tokens=1000,
+                output_tokens=50,
+                cache_read_tokens=10,
+                cache_write_tokens=5,
+                estimated_cost_usd=0.0123,
+                cost_status="estimated",
+                cost_source="pricing_table",
+            )
+            db.record_llm_usage_event(
+                timestamp=now,
+                session_id="main-analytics-test",
+                source="cli",
+                category="main",
+                task="chat",
+                provider="openai",
+                model="gpt-5",
+                input_tokens=999,
+                output_tokens=999,
+                estimated_cost_usd=9.99,
+                cost_status="estimated",
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/usage?days=7")
+        assert resp.status_code == 200
+
+        auxiliary = resp.json()["auxiliary"]
+        assert auxiliary["totals"]["total_calls"] == 1
+        assert auxiliary["totals"]["total_input"] == 1000
+        assert auxiliary["totals"]["total_output"] == 50
+        assert auxiliary["totals"]["total_cache_read"] == 10
+        assert auxiliary["totals"]["total_cache_write"] == 5
+        assert auxiliary["totals"]["total_tokens"] == 1065
+        assert auxiliary["totals"]["total_estimated_cost"] == pytest.approx(0.0123)
+        assert auxiliary["totals"]["unknown_cost_calls"] == 0
+        assert auxiliary["totals"]["distinct_models"] == 1
+        assert auxiliary["totals"]["distinct_tasks"] == 1
+
+        model = auxiliary["by_model"][0]
+        assert model["provider"] == "google"
+        assert model["model"] == "gemini-3.1-pro-preview"
+        assert model["calls"] == 1
+        assert model["estimated_cost"] == pytest.approx(0.0123)
+
+        task = auxiliary["by_task"][0]
+        assert task["task"] == "context_compression"
+        assert task["total_tokens"] == 1065
+        assert auxiliary["daily"][0]["calls"] == 1
 
     def test_session_token_endpoint_removed(self):
         """GET /api/auth/session-token no longer exists."""

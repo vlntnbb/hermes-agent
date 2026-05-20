@@ -396,9 +396,11 @@ stt:
                                     # passes its path to the agent as part of the
                                     # inbound message, useful for custom pipelines
                                     # (diarization, alignment, archival, etc.)
-  provider: "local"                  # "local" (free) | "groq" | "openai"
+  provider: "local"                  # "local" (free) | "gigaam" | "groq" | "openai" | "xai"
   local:
     model: "base"                    # tiny, base, small, medium, large-v3
+  gigaam:
+    model: "v3_e2e_rnnt"             # local Russian STT
   # model: "whisper-1"              # Legacy: used when provider is not set
 
 # Text-to-Speech
@@ -497,7 +499,7 @@ The bot requires an @mention by default in server channels. Make sure you:
 
 ### Bot hears me but doesn't respond
 
-- Verify STT is available: install `faster-whisper` (no key needed) or set `GROQ_API_KEY` / `VOICE_TOOLS_OPENAI_KEY`
+- Verify STT is available: install `faster-whisper` (no key needed), set `stt.provider: gigaam`, or set `GROQ_API_KEY` / `VOICE_TOOLS_OPENAI_KEY`
 - Check the LLM model is configured and accessible
 - Review gateway logs: `tail -f ~/.hermes/logs/gateway.log`
 

@@ -2555,6 +2555,8 @@ def _retry_same_provider_sync(
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
+    usage_session_id: Optional[str] = None,
+    usage_source: Optional[str] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -2592,8 +2594,15 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
+    return _validate_and_record_llm_response(
+        retry_client.chat.completions.create(**retry_kwargs),
+        task,
+        provider=resolved_provider,
+        model=retry_model or final_model,
+        base_url=retry_base or resolved_base_url,
+        api_mode=resolved_api_mode,
+        session_id=usage_session_id,
+        source=usage_source,
     )
 
 
@@ -2612,6 +2621,8 @@ async def _retry_same_provider_async(
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
+    usage_session_id: Optional[str] = None,
+    usage_source: Optional[str] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -2649,8 +2660,15 @@ async def _retry_same_provider_async(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        await retry_client.chat.completions.create(**retry_kwargs), task,
+    return _validate_and_record_llm_response(
+        await retry_client.chat.completions.create(**retry_kwargs),
+        task,
+        provider=resolved_provider,
+        model=retry_model or final_model,
+        base_url=retry_base or resolved_base_url,
+        api_mode=resolved_api_mode,
+        session_id=usage_session_id,
+        source=usage_source,
     )
 
 
@@ -4569,6 +4587,117 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+def _plain_usage_value(value: Any) -> Any:
+    """Convert SDK usage objects into JSON-safe primitives."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _plain_usage_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_usage_value(v) for v in value]
+    if hasattr(value, "__dict__"):
+        return {
+            str(k): _plain_usage_value(v)
+            for k, v in vars(value).items()
+            if not k.startswith("_")
+        }
+    return str(value)
+
+
+def _record_auxiliary_usage(
+    response: Any,
+    *,
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+    session_id: Optional[str],
+    source: Optional[str],
+) -> Any:
+    """Persist usage from one auxiliary LLM response, best-effort."""
+    usage_obj = getattr(response, "usage", None)
+    if not usage_obj:
+        return response
+    try:
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from hermes_state import SessionDB
+
+        response_model = getattr(response, "model", None)
+        final_model = model or response_model or ""
+        canonical = normalize_usage(usage_obj, provider=provider, api_mode=api_mode)
+        if canonical.total_tokens <= 0:
+            return response
+        cost = estimate_usage_cost(
+            final_model,
+            canonical,
+            provider=provider,
+            base_url=base_url,
+        )
+        raw_usage = json.dumps(_plain_usage_value(usage_obj), ensure_ascii=False)
+        db = SessionDB()
+        try:
+            db.record_llm_usage_event(
+                session_id=session_id,
+                source=source,
+                category="auxiliary",
+                task=task or "call",
+                provider=provider,
+                model=final_model,
+                base_url=base_url,
+                api_mode=api_mode,
+                input_tokens=canonical.input_tokens,
+                output_tokens=canonical.output_tokens,
+                cache_read_tokens=canonical.cache_read_tokens,
+                cache_write_tokens=canonical.cache_write_tokens,
+                reasoning_tokens=canonical.reasoning_tokens,
+                total_tokens=canonical.total_tokens,
+                estimated_cost_usd=(
+                    float(cost.amount_usd) if cost.amount_usd is not None else None
+                ),
+                cost_status=cost.status,
+                cost_source=cost.source,
+                pricing_version=cost.pricing_version,
+                raw_usage=raw_usage,
+            )
+        finally:
+            db.close()
+        logger.debug(
+            "Auxiliary %s usage recorded: provider=%s model=%s tokens=%s cost_status=%s",
+            task or "call",
+            provider or "unknown",
+            final_model or "unknown",
+            canonical.total_tokens,
+            cost.status,
+        )
+    except Exception:
+        logger.debug("Auxiliary usage accounting failed", exc_info=True)
+    return response
+
+
+def _validate_and_record_llm_response(
+    response: Any,
+    task: Optional[str],
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+    session_id: Optional[str],
+    source: Optional[str],
+) -> Any:
+    return _record_auxiliary_usage(
+        _validate_llm_response(response, task),
+        task=task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        session_id=session_id,
+        source=source,
+    )
+
+
 def call_llm(
     task: str = None,
     *,
@@ -4583,6 +4712,8 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    usage_session_id: str = None,
+    usage_source: str = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -4697,8 +4828,16 @@ def call_llm(
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     try:
-        return _validate_llm_response(
-            client.chat.completions.create(**kwargs), task)
+        return _validate_and_record_llm_response(
+            client.chat.completions.create(**kwargs),
+            task,
+            provider=resolved_provider,
+            model=final_model,
+            base_url=_base_info or resolved_base_url,
+            api_mode=resolved_api_mode,
+            session_id=usage_session_id,
+            source=usage_source,
+        )
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -4708,8 +4847,16 @@ def call_llm(
                 task or "call",
             )
             try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**retry_kwargs), task)
+                return _validate_and_record_llm_response(
+                    client.chat.completions.create(**retry_kwargs),
+                    task,
+                    provider=resolved_provider,
+                    model=final_model,
+                    base_url=_base_info or resolved_base_url,
+                    api_mode=resolved_api_mode,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -4746,8 +4893,16 @@ def call_llm(
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                return _validate_and_record_llm_response(
+                    client.chat.completions.create(**kwargs),
+                    task,
+                    provider=resolved_provider,
+                    model=final_model,
+                    base_url=_base_info or resolved_base_url,
+                    api_mode=resolved_api_mode,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -4776,8 +4931,16 @@ def call_llm(
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
-                return _validate_llm_response(
-                    refreshed_client.chat.completions.create(**kwargs), task)
+                return _validate_and_record_llm_response(
+                    refreshed_client.chat.completions.create(**kwargs),
+                    task,
+                    provider=resolved_provider,
+                    model=refreshed_model or final_model,
+                    base_url=str(getattr(refreshed_client, "base_url", "") or _base_info or resolved_base_url),
+                    api_mode=resolved_api_mode,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
 
         # ── Auth refresh retry ───────────────────────────────────────
         if (_is_auth_error(first_err)
@@ -4803,6 +4966,8 @@ def call_llm(
                     tools=tools,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
+                    usage_session_id=usage_session_id,
+                    usage_source=usage_source,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -4811,8 +4976,16 @@ def call_llm(
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
                 try:
-                    return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                    return _validate_and_record_llm_response(
+                        client.chat.completions.create(**kwargs),
+                        task,
+                        provider=resolved_provider,
+                        model=final_model,
+                        base_url=_base_info or resolved_base_url,
+                        api_mode=resolved_api_mode,
+                        session_id=usage_session_id,
+                        source=usage_source,
+                    )
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -4837,6 +5010,8 @@ def call_llm(
                     tools=tools,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
+                    usage_session_id=usage_session_id,
+                    usage_source=usage_source,
                 )
 
         # ── Payment / credit exhaustion fallback ──────────────────────
@@ -4912,8 +5087,16 @@ def call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+                return _validate_and_record_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs),
+                    task,
+                    provider=fb_label,
+                    model=fb_model,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""),
+                    api_mode=None,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -5005,6 +5188,8 @@ async def async_call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    usage_session_id: str = None,
+    usage_source: str = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -5082,8 +5267,16 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
-        return _validate_llm_response(
-            await client.chat.completions.create(**kwargs), task)
+        return _validate_and_record_llm_response(
+            await client.chat.completions.create(**kwargs),
+            task,
+            provider=resolved_provider,
+            model=final_model,
+            base_url=_client_base or resolved_base_url,
+            api_mode=resolved_api_mode,
+            session_id=usage_session_id,
+            source=usage_source,
+        )
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -5093,8 +5286,16 @@ async def async_call_llm(
                 task or "call",
             )
             try:
-                return _validate_llm_response(
-                    await client.chat.completions.create(**retry_kwargs), task)
+                return _validate_and_record_llm_response(
+                    await client.chat.completions.create(**retry_kwargs),
+                    task,
+                    provider=resolved_provider,
+                    model=final_model,
+                    base_url=_client_base or resolved_base_url,
+                    api_mode=resolved_api_mode,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 if not (
@@ -5127,8 +5328,16 @@ async def async_call_llm(
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
-                return _validate_llm_response(
-                    await client.chat.completions.create(**kwargs), task)
+                return _validate_and_record_llm_response(
+                    await client.chat.completions.create(**kwargs),
+                    task,
+                    provider=resolved_provider,
+                    model=final_model,
+                    base_url=_client_base or resolved_base_url,
+                    api_mode=resolved_api_mode,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -5156,8 +5365,16 @@ async def async_call_llm(
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
-                return _validate_llm_response(
-                    await refreshed_client.chat.completions.create(**kwargs), task)
+                return _validate_and_record_llm_response(
+                    await refreshed_client.chat.completions.create(**kwargs),
+                    task,
+                    provider=resolved_provider,
+                    model=refreshed_model or final_model,
+                    base_url=str(getattr(refreshed_client, "base_url", "") or _client_base or resolved_base_url),
+                    api_mode=resolved_api_mode,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
         if (_is_auth_error(first_err)
@@ -5182,6 +5399,8 @@ async def async_call_llm(
                     tools=tools,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
+                    usage_session_id=usage_session_id,
+                    usage_source=usage_source,
                 )
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
@@ -5190,8 +5409,16 @@ async def async_call_llm(
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
                 try:
-                    return _validate_llm_response(
-                        await client.chat.completions.create(**kwargs), task)
+                    return _validate_and_record_llm_response(
+                        await client.chat.completions.create(**kwargs),
+                        task,
+                        provider=resolved_provider,
+                        model=final_model,
+                        base_url=_client_base or resolved_base_url,
+                        api_mode=resolved_api_mode,
+                        session_id=usage_session_id,
+                        source=usage_source,
+                    )
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -5215,6 +5442,8 @@ async def async_call_llm(
                     tools=tools,
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
+                    usage_session_id=usage_session_id,
+                    usage_source=usage_source,
                 )
 
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
@@ -5270,8 +5499,16 @@ async def async_call_llm(
                 )
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
-                return _validate_llm_response(
-                    await async_fb.chat.completions.create(**fb_kwargs), task)
+                return _validate_and_record_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs),
+                    task,
+                    provider=fb_label,
+                    model=async_fb_model or fb_model,
+                    base_url=str(getattr(async_fb, "base_url", "") or getattr(fb_client, "base_url", "") or ""),
+                    api_mode=None,
+                    session_id=usage_session_id,
+                    source=usage_source,
+                )
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "

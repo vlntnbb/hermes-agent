@@ -103,6 +103,126 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+_TELEGRAM_AUDIO_EXTENSIONS = {
+    ".mp3", ".mp4", ".mpeg", ".mpga", ".m4a",
+    ".wav", ".webm", ".ogg", ".aac", ".flac",
+}
+_TELEGRAM_AUDIO_MIME_TO_EXT = {
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/m4a": ".m4a",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/mpga": ".mpga",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".ogg",
+    "audio/wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-aac": ".aac",
+    "audio/x-flac": ".flac",
+    "audio/x-m4a": ".m4a",
+    "audio/x-wav": ".wav",
+}
+_TELEGRAM_AUDIO_EXT_TO_MIME = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpga",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
+_TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+
+
+def _telegram_audio_ext(
+    media: Any = None,
+    file_path: Optional[str] = None,
+    fallback: str = ".mp3",
+) -> str:
+    """Best-effort extension for Telegram audio payloads.
+
+    Telegram iOS may send voice memo / Files audio as a document with an
+    ``audio/*`` MIME type instead of the dedicated ``audio`` or ``voice`` field.
+    The extension is important because STT providers inspect filenames.
+    """
+    candidates = [
+        getattr(media, "file_name", None),
+        file_path,
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        _root, ext = os.path.splitext(str(candidate))
+        ext = ext.lower()
+        if ext in _TELEGRAM_AUDIO_EXTENSIONS:
+            return ext
+
+    mime_type = (getattr(media, "mime_type", None) or "").lower()
+    if mime_type in _TELEGRAM_AUDIO_MIME_TO_EXT:
+        return _TELEGRAM_AUDIO_MIME_TO_EXT[mime_type]
+    if mime_type.startswith("audio/"):
+        return fallback
+    return fallback
+
+
+def _telegram_audio_mime(media: Any = None, ext: str = "") -> str:
+    mime_type = (getattr(media, "mime_type", None) or "").lower()
+    if mime_type.startswith("audio/"):
+        return mime_type
+    return _TELEGRAM_AUDIO_EXT_TO_MIME.get((ext or "").lower(), "audio/mpeg")
+
+
+def _telegram_file_size(media: Any = None) -> Optional[int]:
+    raw_size = getattr(media, "file_size", None)
+    if raw_size in (None, ""):
+        return None
+    try:
+        size = int(raw_size)
+    except (TypeError, ValueError):
+        return None
+    return size if size >= 0 else None
+
+
+def _telegram_file_too_big_error(exc: Exception) -> bool:
+    return "file is too big" in str(exc).lower()
+
+
+def _telegram_download_limit_note(kind: str, file_size: Optional[int]) -> str:
+    size_note = ""
+    if file_size:
+        size_note = f" ({file_size / (1024 * 1024):.1f} MB)"
+    return (
+        f"[СИСТЕМНО: пользователь отправил {kind}{size_note}, но Telegram Bot API "
+        "не дал боту скачать файл, потому что он больше лимита 20 MB. Скажи "
+        "пользователю именно это. Не говори, что не видишь вложение; объясни "
+        "лимит размера и попроси файл меньше, аудио частями или доступную ссылку.]"
+    )
+
+
+def _telegram_download_limit_user_message(kind: str, file_size: Optional[int]) -> str:
+    size_line = ""
+    if file_size:
+        size_line = f"\n\nРазмер файла: {file_size / (1024 * 1024):.1f} МБ."
+    return (
+        f"🎤 Не могу скачать {kind}: Telegram Bot API не отдаёт ботам файлы "
+        f"больше 20 МБ.{size_line}\n\n"
+        "Чтобы я сделал идеальную транскрибацию, пришлите аудио частями, "
+        "сожмите файл до 20 МБ или дайте ссылку на Drive/другой источник, "
+        "к которому у меня есть доступ."
+    )
+
+
+def _prepend_event_text(event: MessageEvent, note: str) -> None:
+    if event.text:
+        event.text = f"{note}\n\n{event.text}"
+    else:
+        event.text = note
 
 
 MAX_COMMANDS_PER_SCOPE = 30
@@ -420,6 +540,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._text_batch_split_delay_seconds = self._env_float_clamped(
             "HERMES_TELEGRAM_TEXT_BATCH_SPLIT_DELAY_SECONDS",
             1.0,
+            min_value=self._text_batch_delay_seconds,
+            max_value=4.0,
+        )
+        self._forward_batch_delay_seconds = self._env_float_clamped(
+            "HERMES_TELEGRAM_FORWARD_BATCH_DELAY_SECONDS",
+            self._media_batch_delay_seconds,
             min_value=self._text_batch_delay_seconds,
             max_value=4.0,
         )
@@ -1643,6 +1769,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 task.cancel()
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
+
+        for task in self._pending_text_batch_tasks.values():
+            if task and not task.done():
+                task.cancel()
+        self._pending_text_batch_tasks.clear()
+        self._pending_text_batches.clear()
 
         self._mark_disconnected()
         self._app = None
@@ -4761,6 +4893,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
+        event._telegram_forwarded = self._is_forwarded_message(msg)  # type: ignore[attr-defined]
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4830,6 +4963,86 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+    @staticmethod
+    def _is_mock_value(value: Any) -> bool:
+        return value.__class__.__module__.startswith("unittest.mock")
+
+    @classmethod
+    def _is_forwarded_message(cls, message: Optional[Message]) -> bool:
+        """Return True for real Telegram forwarded-message metadata.
+
+        Unit tests often use ``MagicMock`` messages where any unknown
+        attribute is truthy; ignore those synthetic values so mocks don't look
+        forwarded unless a test explicitly sets real metadata.
+        """
+        if message is None:
+            return False
+        for attr in (
+            "forward_origin",
+            "forward_from",
+            "forward_from_chat",
+            "forward_sender_name",
+            "forward_date",
+        ):
+            value = getattr(message, attr, None)
+            if value is not None and not cls._is_mock_value(value):
+                return True
+        return False
+
+    def _text_batch_needs_burst_delay(self, event: Optional[MessageEvent]) -> bool:
+        if event is None:
+            return False
+        if bool(getattr(event, "_telegram_forwarded", False)):
+            return True
+        if self._is_forwarded_message(getattr(event, "raw_message", None)):
+            return True
+        if event.media_urls:
+            return True
+        return event.message_type in {
+            MessageType.AUDIO,
+            MessageType.VOICE,
+            MessageType.DOCUMENT,
+            MessageType.VIDEO,
+        }
+
+    async def _send_download_limit_notice(
+        self,
+        event: MessageEvent,
+        *,
+        kind: str,
+        file_size: Optional[int],
+    ) -> None:
+        """Reply directly when Telegram refuses to expose an oversized file."""
+        metadata: Dict[str, Any] = {"notify": True}
+        source = event.source
+        thread_id = getattr(source, "thread_id", None)
+        if thread_id is not None:
+            metadata["thread_id"] = thread_id
+        if (
+            thread_id is not None
+            and getattr(source, "chat_type", None) == "dm"
+            and event.message_id is not None
+        ):
+            metadata["telegram_dm_topic_reply_fallback"] = True
+            metadata["telegram_reply_to_message_id"] = str(event.message_id)
+
+        user_message = _telegram_download_limit_user_message(kind, file_size)
+        result = await self.send(
+            source.chat_id,
+            user_message,
+            reply_to=event.message_id,
+            metadata=metadata,
+        )
+        if result.success:
+            return
+
+        logger.warning(
+            "[Telegram] Failed to send oversized-file notice directly: %s",
+            result.error,
+        )
+        _prepend_event_text(event, _telegram_download_limit_note(kind, file_size))
+        await self.handle_message(event)
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -4841,6 +5054,10 @@ class TelegramAdapter(BasePlatformAdapter):
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        event._telegram_forwarded = (  # type: ignore[attr-defined]
+            bool(getattr(event, "_telegram_forwarded", False))
+            or self._is_forwarded_message(getattr(event, "raw_message", None))
+        )
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
@@ -4853,6 +5070,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            if existing.message_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
+                existing.message_type = event.message_type
+            existing._telegram_forwarded = (  # type: ignore[attr-defined]
+                bool(getattr(existing, "_telegram_forwarded", False))
+                or bool(getattr(event, "_telegram_forwarded", False))
+            )
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -4893,6 +5116,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 delay = min(self._text_batch_delay_seconds, self._TEXT_BATCH_SHORT_DELAY_S)
             else:
                 delay = self._text_batch_delay_seconds
+            if self._text_batch_needs_burst_delay(pending):
+                delay = max(delay, self._forward_batch_delay_seconds)
             await asyncio.sleep(delay)
             event = self._pending_text_batches.pop(key, None)
             if not event:
@@ -4995,6 +5220,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
         
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        event._telegram_forwarded = self._is_forwarded_message(msg)  # type: ignore[attr-defined]
         
         # Add caption as text
         if msg.caption:
@@ -5045,25 +5271,64 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Download voice/audio messages to cache for STT transcription
         if msg.voice:
-            try:
-                file_obj = await msg.voice.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
-                event.media_urls = [cached_path]
-                event.media_types = ["audio/ogg"]
-                logger.info("[Telegram] Cached user voice at %s", cached_path)
-            except Exception as e:
-                logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
+            voice_size = _telegram_file_size(msg.voice)
+            if voice_size and voice_size > _TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES:
+                logger.info("[Telegram] Voice message too large for Bot API download: %s bytes", voice_size)
+                await self._send_download_limit_notice(
+                    event,
+                    kind="голосовое сообщение",
+                    file_size=voice_size,
+                )
+                return
+            else:
+                try:
+                    file_obj = await msg.voice.get_file()
+                    audio_bytes = await file_obj.download_as_bytearray()
+                    cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
+                    event.media_urls = [cached_path]
+                    event.media_types = ["audio/ogg"]
+                    logger.info("[Telegram] Cached user voice at %s", cached_path)
+                except Exception as e:
+                    if _telegram_file_too_big_error(e):
+                        await self._send_download_limit_notice(
+                            event,
+                            kind="голосовое сообщение",
+                            file_size=voice_size,
+                        )
+                        return
+                    logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
         elif msg.audio:
-            try:
-                file_obj = await msg.audio.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
-                event.media_urls = [cached_path]
-                event.media_types = ["audio/mp3"]
-                logger.info("[Telegram] Cached user audio at %s", cached_path)
-            except Exception as e:
-                logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
+            audio_size = _telegram_file_size(msg.audio)
+            if audio_size and audio_size > _TELEGRAM_BOT_API_DOWNLOAD_LIMIT_BYTES:
+                logger.info("[Telegram] Audio message too large for Bot API download: %s bytes", audio_size)
+                await self._send_download_limit_notice(
+                    event,
+                    kind="аудиофайл",
+                    file_size=audio_size,
+                )
+                return
+            else:
+                try:
+                    file_obj = await msg.audio.get_file()
+                    audio_bytes = await file_obj.download_as_bytearray()
+                    audio_ext = _telegram_audio_ext(
+                        msg.audio,
+                        getattr(file_obj, "file_path", None),
+                        fallback=".mp3",
+                    )
+                    cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=audio_ext)
+                    event.media_urls = [cached_path]
+                    event.media_types = [_telegram_audio_mime(msg.audio, audio_ext)]
+                    logger.info("[Telegram] Cached user audio at %s", cached_path)
+                except Exception as e:
+                    if _telegram_file_too_big_error(e):
+                        await self._send_download_limit_notice(
+                            event,
+                            kind="аудиофайл",
+                            file_size=audio_size,
+                        )
+                        return
+                    logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
 
         elif msg.video:
             try:
@@ -5107,12 +5372,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Check file size early so image documents cannot bypass the
                 # document size limit by taking the image path.
                 if not doc.file_size or doc.file_size > self._max_doc_bytes:
+                    is_oversized_audio = ext in _TELEGRAM_AUDIO_EXTENSIONS or doc_mime.startswith("audio/")
+                    if is_oversized_audio:
+                        logger.info("[Telegram] audio document too large: %s bytes", doc.file_size)
+                        await self._send_download_limit_notice(
+                            event,
+                            kind="аудиофайл",
+                            file_size=_telegram_file_size(doc),
+                        )
+                        return
                     limit_mb = self._max_doc_bytes // (1024 * 1024)
                     event.text = (
                         "The document is too large or its size could not be verified. "
                         f"Maximum: {limit_mb} MB."
                     )
-                    logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
+                    logger.info("[Telegram] document too large: %s bytes", doc.file_size)
                     await self.handle_message(event)
                     return
 
@@ -5151,15 +5425,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     video_mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
                     ext = video_mime_to_ext.get(doc.mime_type, "")
 
-                if not ext and doc.mime_type:
-                    # SUPPORTED_IMAGE_DOCUMENT_TYPES has duplicate values (.jpg + .jpeg
-                    # both map to image/jpeg); keep the first ext we encounter.
-                    image_mime_to_ext: dict[str, str] = {}
-                    for _ext, _mime in SUPPORTED_IMAGE_DOCUMENT_TYPES.items():
-                        image_mime_to_ext.setdefault(_mime, _ext)
-                    ext = image_mime_to_ext.get(doc.mime_type, "")
-
-                if ext in SUPPORTED_VIDEO_TYPES:
+                if ext in SUPPORTED_VIDEO_TYPES and not doc_mime.startswith("audio/"):
                     file_obj = await doc.get_file()
                     video_bytes = await file_obj.download_as_bytearray()
                     cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
@@ -5176,44 +5442,57 @@ class TelegramAdapter(BasePlatformAdapter):
                 # ext-in-SUPPORTED_IMAGE_DOCUMENT_TYPES branch would be dead
                 # code — the extension sets are identical.
 
-                # Check if supported
-                if ext not in SUPPORTED_DOCUMENT_TYPES:
-                    supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
-                    event.text = (
-                        f"Unsupported document type '{ext or 'unknown'}'. "
-                        f"Supported types: {supported_list}"
-                    )
-                    logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
-                    await self.handle_message(event)
-                    return
-
-                # Download and cache
-                file_obj = await doc.get_file()
-                doc_bytes = await file_obj.download_as_bytearray()
-                raw_bytes = bytes(doc_bytes)
-                cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
-                mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
-                event.media_urls = [cached_path]
-                event.media_types = [mime_type]
-                logger.info("[Telegram] Cached user document at %s", cached_path)
-
-                # For text files, inject content into event.text (capped at 100 KB)
-                MAX_TEXT_INJECT_BYTES = 100 * 1024
-                if ext in {".md", ".txt"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
-                    try:
-                        text_content = raw_bytes.decode("utf-8")
-                        display_name = original_filename or f"document{ext}"
-                        display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                        injection = f"[Content of {display_name}]:\n{text_content}"
-                        if event.text:
-                            event.text = f"{injection}\n\n{event.text}"
-                        else:
-                            event.text = injection
-                    except UnicodeDecodeError:
-                        logger.warning(
-                            "[Telegram] Could not decode text file as UTF-8, skipping content injection",
-                            exc_info=True,
+                audio_ext = ""
+                if ext in _TELEGRAM_AUDIO_EXTENSIONS:
+                    audio_ext = ext
+                elif doc_mime.startswith("audio/"):
+                    audio_ext = _telegram_audio_ext(doc, fallback=".m4a")
+                if audio_ext:
+                    file_obj = await doc.get_file()
+                    audio_bytes = await file_obj.download_as_bytearray()
+                    cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=audio_ext)
+                    event.media_urls = [cached_path]
+                    event.media_types = [_telegram_audio_mime(doc, audio_ext)]
+                    event.message_type = MessageType.AUDIO
+                    logger.info("[Telegram] Cached user audio document at %s", cached_path)
+                else:
+                    if ext not in SUPPORTED_DOCUMENT_TYPES:
+                        supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
+                        event.text = (
+                            f"Unsupported document type '{ext or 'unknown'}'. "
+                            f"Supported types: {supported_list}"
                         )
+                        logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
+                        await self.handle_message(event)
+                        return
+
+                    # Download and cache
+                    file_obj = await doc.get_file()
+                    doc_bytes = await file_obj.download_as_bytearray()
+                    raw_bytes = bytes(doc_bytes)
+                    cached_path = cache_document_from_bytes(raw_bytes, original_filename or f"document{ext}")
+                    mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
+                    event.media_urls = [cached_path]
+                    event.media_types = [mime_type]
+                    logger.info("[Telegram] Cached user document at %s", cached_path)
+
+                    # For text files, inject content into event.text (capped at 100 KB)
+                    MAX_TEXT_INJECT_BYTES = 100 * 1024
+                    if ext in {".md", ".txt"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                        try:
+                            text_content = raw_bytes.decode("utf-8")
+                            display_name = original_filename or f"document{ext}"
+                            display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                            injection = f"[Content of {display_name}]:\n{text_content}"
+                            if event.text:
+                                event.text = f"{injection}\n\n{event.text}"
+                            else:
+                                event.text = injection
+                        except UnicodeDecodeError:
+                            logger.warning(
+                                "[Telegram] Could not decode text file as UTF-8, skipping content injection",
+                                exc_info=True,
+                            )
 
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
@@ -5221,6 +5500,10 @@ class TelegramAdapter(BasePlatformAdapter):
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
+            return
+
+        if event.message_type in {MessageType.VOICE, MessageType.AUDIO} or bool(getattr(event, "_telegram_forwarded", False)):
+            self._enqueue_text_event(event)
             return
 
         await self.handle_message(event)

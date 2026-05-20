@@ -287,7 +287,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Speech-to-text provider",
         # "mistral" temporarily removed — mistralai PyPI package quarantined
         # (malicious 2.4.6 release on 2026-05-12). Restore once available.
-        "options": ["local", "openai"],
+        "options": ["local", "gigaam", "openai"],
     },
     "display.skin": {
         "type": "select",
@@ -3091,6 +3091,140 @@ async def update_config_raw(body: RawConfigUpdate):
 # ---------------------------------------------------------------------------
 
 
+def _empty_auxiliary_analytics() -> Dict[str, Any]:
+    return {
+        "daily": [],
+        "by_model": [],
+        "by_task": [],
+        "totals": {
+            "total_input": 0,
+            "total_output": 0,
+            "total_cache_read": 0,
+            "total_cache_write": 0,
+            "total_reasoning": 0,
+            "total_tokens": 0,
+            "total_estimated_cost": 0,
+            "total_actual_cost": 0,
+            "total_calls": 0,
+            "unknown_cost_calls": 0,
+            "distinct_models": 0,
+            "distinct_tasks": 0,
+        },
+    }
+
+
+def _get_auxiliary_usage_analytics(db: Any, cutoff: float) -> Dict[str, Any]:
+    """Aggregate non-main LLM usage ledger rows for dashboard analytics."""
+    total_expr = """
+        CASE
+            WHEN COALESCE(total_tokens, 0) > 0 THEN total_tokens
+            ELSE COALESCE(input_tokens, 0)
+               + COALESCE(output_tokens, 0)
+               + COALESCE(cache_read_tokens, 0)
+               + COALESCE(cache_write_tokens, 0)
+               + COALESCE(reasoning_tokens, 0)
+        END
+    """
+    unknown_cost_expr = """
+        CASE
+            WHEN cost_status = 'unknown'
+              OR (estimated_cost_usd IS NULL AND actual_cost_usd IS NULL)
+            THEN 1 ELSE 0
+        END
+    """
+    where_auxiliary = """
+        timestamp > ?
+        AND COALESCE(NULLIF(category, ''), 'auxiliary') != 'main'
+    """
+
+    try:
+        daily_cur = db._conn.execute(f"""
+            SELECT date(timestamp, 'unixepoch') as day,
+                   COALESCE(SUM(input_tokens), 0) as input_tokens,
+                   COALESCE(SUM(output_tokens), 0) as output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                   COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                   COALESCE(SUM({total_expr}), 0) as total_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                   COUNT(*) as calls,
+                   COALESCE(SUM({unknown_cost_expr}), 0) as unknown_cost_calls
+            FROM llm_usage_events
+            WHERE {where_auxiliary}
+            GROUP BY day
+            ORDER BY day
+        """, (cutoff,))
+
+        model_cur = db._conn.execute(f"""
+            SELECT COALESCE(NULLIF(model, ''), 'unknown') as model,
+                   COALESCE(NULLIF(provider, ''), '') as provider,
+                   COALESCE(SUM(input_tokens), 0) as input_tokens,
+                   COALESCE(SUM(output_tokens), 0) as output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                   COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                   COALESCE(SUM({total_expr}), 0) as total_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                   COUNT(*) as calls,
+                   COALESCE(SUM({unknown_cost_expr}), 0) as unknown_cost_calls,
+                   MAX(timestamp) as last_used_at
+            FROM llm_usage_events
+            WHERE {where_auxiliary}
+            GROUP BY provider, model
+            ORDER BY COALESCE(SUM(estimated_cost_usd), 0) DESC,
+                     COALESCE(SUM({total_expr}), 0) DESC
+        """, (cutoff,))
+
+        task_cur = db._conn.execute(f"""
+            SELECT COALESCE(NULLIF(task, ''), 'unknown') as task,
+                   COALESCE(SUM(input_tokens), 0) as input_tokens,
+                   COALESCE(SUM(output_tokens), 0) as output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                   COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+                   COALESCE(SUM({total_expr}), 0) as total_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                   COUNT(*) as calls,
+                   COALESCE(SUM({unknown_cost_expr}), 0) as unknown_cost_calls,
+                   MAX(timestamp) as last_used_at
+            FROM llm_usage_events
+            WHERE {where_auxiliary}
+            GROUP BY task
+            ORDER BY COALESCE(SUM(estimated_cost_usd), 0) DESC,
+                     COALESCE(SUM({total_expr}), 0) DESC
+        """, (cutoff,))
+
+        totals_cur = db._conn.execute(f"""
+            SELECT COALESCE(SUM(input_tokens), 0) as total_input,
+                   COALESCE(SUM(output_tokens), 0) as total_output,
+                   COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
+                   COALESCE(SUM(cache_write_tokens), 0) as total_cache_write,
+                   COALESCE(SUM(reasoning_tokens), 0) as total_reasoning,
+                   COALESCE(SUM({total_expr}), 0) as total_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
+                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
+                   COUNT(*) as total_calls,
+                   COALESCE(SUM({unknown_cost_expr}), 0) as unknown_cost_calls,
+                   COUNT(DISTINCT COALESCE(NULLIF(model, ''), 'unknown')) as distinct_models,
+                   COUNT(DISTINCT COALESCE(NULLIF(task, ''), 'unknown')) as distinct_tasks
+            FROM llm_usage_events
+            WHERE {where_auxiliary}
+        """, (cutoff,))
+    except Exception as exc:
+        _log.warning("Unable to aggregate auxiliary usage analytics: %s", exc)
+        return _empty_auxiliary_analytics()
+
+    return {
+        "daily": [dict(r) for r in daily_cur.fetchall()],
+        "by_model": [dict(r) for r in model_cur.fetchall()],
+        "by_task": [dict(r) for r in task_cur.fetchall()],
+        "totals": dict(totals_cur.fetchone() or _empty_auxiliary_analytics()["totals"]),
+    }
+
+
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):
     from hermes_state import SessionDB
@@ -3138,6 +3272,7 @@ async def get_usage_analytics(days: int = 30):
             FROM sessions WHERE started_at > ?
         """, (cutoff,))
         totals = dict(cur3.fetchone())
+        auxiliary = _get_auxiliary_usage_analytics(db, cutoff)
         insights_report = InsightsEngine(db).generate(days=days)
         skills = insights_report.get("skills", {
             "summary": {
@@ -3155,6 +3290,7 @@ async def get_usage_analytics(days: int = 30):
             "totals": totals,
             "period_days": days,
             "skills": skills,
+            "auxiliary": auxiliary,
         }
     finally:
         db.close()

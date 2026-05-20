@@ -6,14 +6,19 @@ import {
   BarChart3,
   Brain,
   Cpu,
+  DollarSign,
   RefreshCw,
   TrendingUp,
+  Workflow,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   AnalyticsResponse,
   AnalyticsDailyEntry,
   AnalyticsModelEntry,
+  AnalyticsAuxiliaryUsage,
+  AnalyticsAuxiliaryModelEntry,
+  AnalyticsAuxiliaryTaskEntry,
   AnalyticsSkillEntry,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
@@ -34,10 +39,37 @@ const PERIODS = [
 
 const CHART_HEIGHT_PX = 160;
 
+const EMPTY_AUXILIARY_USAGE: AnalyticsAuxiliaryUsage = {
+  daily: [],
+  by_model: [],
+  by_task: [],
+  totals: {
+    total_input: 0,
+    total_output: 0,
+    total_cache_read: 0,
+    total_cache_write: 0,
+    total_reasoning: 0,
+    total_tokens: 0,
+    total_estimated_cost: 0,
+    total_actual_cost: 0,
+    total_calls: 0,
+    unknown_cost_calls: 0,
+    distinct_models: 0,
+    distinct_tasks: 0,
+  },
+};
+
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+function formatCost(n: number): string {
+  if (n >= 1) return `$${n.toFixed(2)}`;
+  if (n >= 0.01) return `$${n.toFixed(3)}`;
+  if (n > 0) return `$${n.toFixed(4)}`;
+  return "$0";
 }
 
 function formatDate(day: string): string {
@@ -282,7 +314,7 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
 
 function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
   const { t } = useI18n();
-  const { sorted, sortKey, sortDir, toggle } = useTableSort(models, "input_tokens", "desc");
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(models, "estimated_cost", "desc");
 
   if (models.length === 0) return null;
 
@@ -303,6 +335,7 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
               <tr className="border-b border-border text-muted-foreground text-xs">
                 <SortHeader label={t.analytics.model} col="model" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
                 <SortHeader label={t.sessions.title} col="sessions" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label="Cost" col="estimated_cost" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
                 <SortHeader label={t.analytics.tokens} col="input_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
               </tr>
             </thead>
@@ -317,6 +350,9 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
                   </td>
                   <td className="text-right py-2 px-4 text-muted-foreground">
                     {m.sessions}
+                  </td>
+                  <td className="text-right py-2 px-4 font-mono text-xs">
+                    {formatCost(m.estimated_cost)}
                   </td>
                   <td className="text-right py-2 pl-4">
                     <span className="text-[#ffe6cb]">
@@ -334,6 +370,271 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function AuxiliaryDailyCostChart({
+  daily,
+}: {
+  daily: AnalyticsAuxiliaryUsage["daily"];
+}) {
+  if (daily.length === 0) return null;
+
+  const maxCost = Math.max(...daily.map((d) => d.estimated_cost), 0.000001);
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <DollarSign className="h-5 w-5 text-muted-foreground" />
+          <CardTitle className="text-base">Auxiliary spend by day</CardTitle>
+        </div>
+        <div className="flex items-center gap-4 text-xs text-muted-foreground">
+          <div className="flex items-center gap-1.5">
+            <div className="h-2.5 w-2.5 bg-amber-500" />
+            Estimated cost
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div
+          className="flex items-end gap-[2px]"
+          style={{ height: CHART_HEIGHT_PX }}
+        >
+          {daily.map((d) => {
+            const costH = Math.round((d.estimated_cost / maxCost) * CHART_HEIGHT_PX);
+            return (
+              <div
+                key={d.day}
+                className="flex-1 min-w-0 group relative flex flex-col justify-end"
+                style={{ height: CHART_HEIGHT_PX }}
+              >
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10 pointer-events-none">
+                  <div className="bg-card border border-border px-2.5 py-1.5 text-[10px] text-foreground shadow-lg whitespace-nowrap">
+                    <div className="font-medium">{formatDate(d.day)}</div>
+                    <div>Cost: {formatCost(d.estimated_cost)}</div>
+                    <div>Calls: {d.calls}</div>
+                    <div>Tokens: {formatTokens(d.total_tokens)}</div>
+                  </div>
+                </div>
+
+                <div
+                  className="w-full bg-amber-500/75"
+                  style={{ height: Math.max(costH, d.estimated_cost > 0 ? 1 : 0) }}
+                />
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="flex justify-between mt-2 text-[10px] text-muted-foreground">
+          <span>{daily.length > 0 ? formatDate(daily[0].day) : ""}</span>
+          {daily.length > 2 && (
+            <span>{formatDate(daily[Math.floor(daily.length / 2)].day)}</span>
+          )}
+          <span>
+            {daily.length > 1 ? formatDate(daily[daily.length - 1].day) : ""}
+          </span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AuxiliaryModelTable({
+  models,
+}: {
+  models: AnalyticsAuxiliaryModelEntry[];
+}) {
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(models, "estimated_cost", "desc");
+
+  if (models.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Cpu className="h-5 w-5 text-muted-foreground" />
+          <CardTitle className="text-base">Auxiliary model spend</CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-muted-foreground text-xs">
+                <SortHeader label="Model" col="model" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label="Calls" col="calls" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label="Cost" col="estimated_cost" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label="Tokens" col="total_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label="Unknown" col="unknown_cost_calls" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((m) => (
+                <tr
+                  key={`${m.provider}:${m.model}`}
+                  className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
+                >
+                  <td className="py-2 pr-4">
+                    <div className="flex min-w-[180px] flex-wrap items-center gap-2">
+                      <span className="font-mono-ui text-xs">{m.model}</span>
+                      {m.provider && (
+                        <Badge tone="secondary" className="text-[9px]">
+                          {m.provider}
+                        </Badge>
+                      )}
+                    </div>
+                  </td>
+                  <td className="text-right py-2 px-4 text-muted-foreground">
+                    {m.calls}
+                  </td>
+                  <td className="text-right py-2 px-4 font-mono text-xs">
+                    {formatCost(m.estimated_cost)}
+                  </td>
+                  <td className="text-right py-2 px-4">
+                    <span className="text-[#ffe6cb]">
+                      {formatTokens(m.input_tokens)}
+                    </span>
+                    {" / "}
+                    <span className="text-emerald-400">
+                      {formatTokens(m.output_tokens)}
+                    </span>
+                    <span className="ml-1 text-muted-foreground">
+                      ({formatTokens(m.total_tokens)})
+                    </span>
+                  </td>
+                  <td className="text-right py-2 pl-4 text-muted-foreground">
+                    {m.unknown_cost_calls}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AuxiliaryTaskTable({
+  tasks,
+}: {
+  tasks: AnalyticsAuxiliaryTaskEntry[];
+}) {
+  const { sorted, sortKey, sortDir, toggle } = useTableSort(tasks, "estimated_cost", "desc");
+
+  if (tasks.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Workflow className="h-5 w-5 text-muted-foreground" />
+          <CardTitle className="text-base">Auxiliary spend by task</CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-muted-foreground text-xs">
+                <SortHeader label="Task" col="task" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-left py-2 pr-4 font-medium" />
+                <SortHeader label="Calls" col="calls" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label="Cost" col="estimated_cost" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label="Tokens" col="total_tokens" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 px-4 font-medium" />
+                <SortHeader label="Last used" col="last_used_at" sortKey={sortKey} sortDir={sortDir} toggle={toggle} className="text-right py-2 pl-4 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((task) => (
+                <tr
+                  key={task.task}
+                  className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
+                >
+                  <td className="py-2 pr-4">
+                    <span className="font-mono-ui text-xs">{task.task}</span>
+                  </td>
+                  <td className="text-right py-2 px-4 text-muted-foreground">
+                    {task.calls}
+                  </td>
+                  <td className="text-right py-2 px-4 font-mono text-xs">
+                    {formatCost(task.estimated_cost)}
+                  </td>
+                  <td className="text-right py-2 px-4">
+                    {formatTokens(task.total_tokens)}
+                  </td>
+                  <td className="text-right py-2 pl-4 text-muted-foreground">
+                    {task.last_used_at ? timeAgo(task.last_used_at) : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AuxiliaryUsageSection({
+  auxiliary,
+}: {
+  auxiliary?: AnalyticsAuxiliaryUsage;
+}) {
+  const usage = auxiliary ?? EMPTY_AUXILIARY_USAGE;
+  const hasUsage =
+    usage.totals.total_calls > 0 ||
+    usage.daily.length > 0 ||
+    usage.by_model.length > 0 ||
+    usage.by_task.length > 0;
+
+  if (!hasUsage) return null;
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <DollarSign className="h-5 w-5 text-muted-foreground" />
+              <CardTitle className="text-base">Auxiliary model costs</CardTitle>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <Stats
+              items={[
+                {
+                  label: "Estimated spend",
+                  value: formatCost(usage.totals.total_estimated_cost),
+                },
+                {
+                  label: "Calls",
+                  value: String(usage.totals.total_calls),
+                },
+                {
+                  label: "Tokens",
+                  value: formatTokens(usage.totals.total_tokens),
+                },
+                {
+                  label: "Models",
+                  value: String(usage.totals.distinct_models),
+                },
+                {
+                  label: "Unknown cost",
+                  value: String(usage.totals.unknown_cost_calls),
+                },
+              ]}
+            />
+          </CardContent>
+        </Card>
+
+        <AuxiliaryDailyCostChart daily={usage.daily} />
+      </div>
+
+      <AuxiliaryModelTable models={usage.by_model} />
+      <AuxiliaryTaskTable tasks={usage.by_task} />
+    </div>
   );
 }
 
@@ -398,9 +699,8 @@ export default function AnalyticsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Gated on `dashboard.show_token_analytics` (default off).  When off the
-  // page renders an explanation card instead of fetching analytics — the
-  // local token counts exclude auxiliary calls and provider retries, so
-  // they diverge from provider billing in ways that mislead users.
+  // page renders an explanation card instead of fetching analytics.  These
+  // are still local estimates and depend on provider usage blocks.
   const [showTokens, setShowTokens] = useState<boolean | null>(null);
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
@@ -489,19 +789,14 @@ export default function AnalyticsPage() {
               </h2>
               <p>
                 The token, cost, and per-day analytics on this page are a
-                local debug estimate. They only count successful main-agent
-                responses with a usable <span className="font-mono">usage</span>{" "}
-                block, and silently exclude auxiliary calls (context
-                compression, title generation, vision, session search, web
-                extract, smart approvals, MCP routing, plugin LLM access)
-                plus provider-side retries and fallback attempts. Cache
-                writes are missing entirely.
+                local debug estimate. They count successful main-agent and
+                auxiliary responses only when the provider returns a usable{" "}
+                <span className="font-mono">usage</span> block.
               </p>
               <p>
-                On models with heavy auxiliary traffic (Kimi K2.6, MiniMax
-                M2.7) the local total can be 10x–100x lower than what your
-                provider bills. Hiding these numbers is safer than letting
-                them look authoritative.
+                Provider-side retries, fallback attempts, cache pricing gaps,
+                and models with unknown pricing can still make the local total
+                lower than the provider bill.
               </p>
               <p>
                 Check your provider dashboard (OpenRouter, Anthropic, etc.)
@@ -573,6 +868,7 @@ export default function AnalyticsPage() {
 
           <DailyTable daily={data.daily} />
           <ModelTable models={data.by_model} />
+          <AuxiliaryUsageSection auxiliary={data.auxiliary} />
           <SkillTable skills={data.skills.top_skills} />
         </>
       )}
@@ -580,6 +876,7 @@ export default function AnalyticsPage() {
       {data &&
         data.daily.length === 0 &&
         data.by_model.length === 0 &&
+        (data.auxiliary?.totals.total_calls ?? 0) === 0 &&
         data.skills.top_skills.length === 0 && (
           <Card>
             <CardContent className="py-12">

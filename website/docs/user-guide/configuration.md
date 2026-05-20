@@ -1295,9 +1295,14 @@ Hashes are deterministic — the same user always maps to the same hash, so the 
 
 ```yaml
 stt:
-  provider: "local"            # "local" | "groq" | "openai" | "mistral"
+  provider: "local"            # "local" | "gigaam" | "groq" | "openai" | "mistral" | "xai"
   local:
     model: "base"              # tiny, base, small, medium, large-v3
+  gigaam:
+    model: "v3_e2e_rnnt"       # v3_e2e_rnnt | v3_e2e_ctc | v2_rnnt | v2_ctc
+    device: "cpu"              # cpu | cuda | mps
+    chunk_sec: 20              # chunk size for long audio
+    fallback_chunking: false   # if HF_TOKEN long-form fails, fall back to chunks
   openai:
     model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
   # model: "whisper-1"         # Legacy fallback key still respected
@@ -1306,10 +1311,11 @@ stt:
 Provider behavior:
 
 - `local` uses `faster-whisper` running on your machine. Install it separately with `pip install faster-whisper`.
+- `gigaam` uses local GigaAM for Russian speech. Hermes converts input to 16 kHz mono WAV, uses `v3_e2e_rnnt` when available, and falls back to v2 models if the installed package does not include v3.
 - `groq` uses Groq's Whisper-compatible endpoint and reads `GROQ_API_KEY`.
 - `openai` uses the OpenAI speech API and reads `VOICE_TOOLS_OPENAI_KEY`.
 
-If the requested provider is unavailable, Hermes falls back automatically in this order: `local` → `groq` → `openai`.
+When no provider is configured, Hermes auto-detects in this order: `local` → `groq` → `openai` → `xai`. `gigaam` is opt-in because it may install the `gigaam` package and download local model weights.
 
 Groq and OpenAI model overrides are environment-driven:
 
@@ -1386,6 +1392,29 @@ group_sessions_per_user: true  # true = per-user isolation in groups/channels, f
 - Threads stay isolated from their parent channel either way; with `true`, each participant also gets their own session inside the thread.
 
 For the behavior details and examples, see [Sessions](/docs/user-guide/sessions) and the [Discord guide](/docs/user-guide/messaging/discord).
+
+## Per-Chat Standards
+
+Use `chat_standards` when you want Hermes to monitor specific shared chats and follow different rules in each one:
+
+```yaml
+chat_standards:
+  telegram:
+    "-1001234567890":
+      standards: |
+        Track decisions, blockers, and follow-ups.
+        When responding, include only the new decision or follow-up.
+  discord:
+    "123456789012345678":
+      listen: true
+      standards: |
+        Treat this channel as engineering triage.
+        Keep replies concise and always include the next action.
+```
+
+By default each entry sets that chat to listen-all/free-response mode, so Hermes processes every message without requiring an `@mention`. Set `listen: false` to apply the standards only after the platform's normal trigger.
+
+Supported listen-all targets are `telegram`, `whatsapp`, `dingtalk`, `discord`, `slack`, `mattermost`, and `matrix`.
 
 ## Unauthorized DM Behavior
 

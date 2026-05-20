@@ -50,6 +50,19 @@ _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
 
 
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+        return default
+    return bool(value)
+
+
 def check_mattermost_requirements() -> bool:
     """Return True if the Mattermost adapter can be used."""
     token = os.getenv("MATTERMOST_TOKEN", "")
@@ -751,12 +764,30 @@ class MattermostAdapter(BasePlatformAdapter):
                 )
                 return
 
-            require_mention = os.getenv(
-                "MATTERMOST_REQUIRE_MENTION", "true"
-            ).lower() not in {"false", "0", "no"}
+            require_mention_raw = (
+                self.config.extra.get("require_mention")
+                if self.config.extra
+                else None
+            )
+            if require_mention_raw is None:
+                require_mention_raw = os.getenv("MATTERMOST_REQUIRE_MENTION", "true")
+            require_mention = _coerce_bool(require_mention_raw, True)
 
-            free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
-            free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+            free_channels_raw = (
+                self.config.extra.get("free_response_channels")
+                if self.config.extra
+                else None
+            )
+            if free_channels_raw is None:
+                free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
+            if isinstance(free_channels_raw, list):
+                free_channels = {
+                    str(ch).strip() for ch in free_channels_raw if str(ch).strip()
+                }
+            else:
+                free_channels = {
+                    ch.strip() for ch in str(free_channels_raw).split(",") if ch.strip()
+                }
             is_free_channel = channel_id in free_channels
 
             mention_patterns = [
@@ -869,5 +900,3 @@ class MattermostAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(msg_event)
-
-

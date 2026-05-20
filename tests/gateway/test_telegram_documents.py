@@ -111,6 +111,44 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     return msg
 
 
+def _make_text_message(text: str, *, forward_origin=None):
+    """Build a mock Telegram text message."""
+    msg = _make_message()
+    msg.text = text
+    msg.caption = None
+    msg.forward_origin = forward_origin
+    return msg
+
+
+def _make_voice_message(file_obj=None, *, forward_origin=None, file_size=1024):
+    """Build a mock Telegram voice message."""
+    voice = MagicMock()
+    voice.file_size = file_size
+    voice.get_file = AsyncMock(return_value=file_obj or _make_file_obj(b"voice-bytes"))
+    msg = _make_message()
+    msg.voice = voice
+    msg.forward_origin = forward_origin
+    return msg
+
+
+def _make_audio_message(
+    file_obj=None,
+    *,
+    file_name="clip.m4a",
+    mime_type="audio/mp4",
+    file_size=1024,
+):
+    """Build a mock Telegram audio message."""
+    audio = MagicMock()
+    audio.file_name = file_name
+    audio.mime_type = mime_type
+    audio.file_size = file_size
+    audio.get_file = AsyncMock(return_value=file_obj or _make_file_obj(b"audio-bytes"))
+    msg = _make_message()
+    msg.audio = audio
+    return msg
+
+
 def _make_update(msg):
     """Wrap a message in a mock Update."""
     update = MagicMock()
@@ -431,6 +469,97 @@ class TestVideoDownloadBlock:
         assert event.media_types == [SUPPORTED_VIDEO_TYPES[".mp4"]]
 
 
+class TestAudioDownloadBlock:
+    @staticmethod
+    def _make_text_batch_immediate(adapter):
+        adapter._text_batch_delay_seconds = 0.01
+        adapter._text_batch_split_delay_seconds = 0.01
+        adapter._forward_batch_delay_seconds = 0.01
+
+    @pytest.mark.asyncio
+    async def test_native_m4a_audio_preserves_extension(self, adapter):
+        self._make_text_batch_immediate(adapter)
+        file_obj = _make_file_obj(b"fake-m4a")
+        file_obj.file_path = "audio/clip.m4a"
+        msg = _make_audio_message(file_obj, file_name="clip.m4a", mime_type="audio/mp4")
+
+        with patch("gateway.platforms.telegram.cache_audio_from_bytes", return_value="/tmp/clip.m4a") as cache_audio:
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+            await asyncio.sleep(0.03)
+
+        cache_audio.assert_called_once()
+        assert cache_audio.call_args.kwargs["ext"] == ".m4a"
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.AUDIO
+        assert event.media_urls == ["/tmp/clip.m4a"]
+        assert event.media_types == ["audio/mp4"]
+
+    @pytest.mark.asyncio
+    async def test_m4a_document_is_treated_as_audio(self, adapter):
+        self._make_text_batch_immediate(adapter)
+        file_obj = _make_file_obj(b"fake-m4a-doc")
+        file_obj.file_path = "documents/voice-memo.m4a"
+        doc = _make_document(
+            file_name="voice-memo.m4a",
+            mime_type="audio/x-m4a",
+            file_size=1024,
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc, caption="Transcribe this")
+
+        with patch("gateway.platforms.telegram.cache_audio_from_bytes", return_value="/tmp/voice-memo.m4a") as cache_audio:
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+            await asyncio.sleep(0.03)
+
+        cache_audio.assert_called_once()
+        assert cache_audio.call_args.kwargs["ext"] == ".m4a"
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.AUDIO
+        assert event.media_urls == ["/tmp/voice-memo.m4a"]
+        assert event.media_types == ["audio/x-m4a"]
+        assert event.text == "Transcribe this"
+
+    @pytest.mark.asyncio
+    async def test_large_native_audio_surfaces_download_limit(self, adapter):
+        self._make_text_batch_immediate(adapter)
+        msg = _make_audio_message(file_size=25 * 1024 * 1024)
+        msg.audio.get_file = AsyncMock(side_effect=AssertionError("should not download oversized audio"))
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        msg.audio.get_file.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        sent_text = adapter.send.await_args.args[1]
+        assert "Telegram Bot API" in sent_text
+        assert "20 МБ" in sent_text
+        assert "25.0 МБ" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_large_audio_document_message_is_specific(self, adapter):
+        doc = _make_document(
+            file_name="voice-memo.m4a",
+            mime_type="audio/x-m4a",
+            file_size=25 * 1024 * 1024,
+        )
+        doc.get_file = AsyncMock(side_effect=AssertionError("should not download oversized audio document"))
+        msg = _make_message(document=doc, caption="Transcribe this")
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        doc.get_file.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        sent_text = adapter.send.await_args.args[1]
+        assert "Telegram Bot API" in sent_text
+        assert "20 МБ" in sent_text
+        assert "25.0 МБ" in sent_text
+
+
 # ---------------------------------------------------------------------------
 # TestMediaGroups — media group (album) buffering
 # ---------------------------------------------------------------------------
@@ -493,6 +622,35 @@ class TestMediaGroups:
         assert adapter._media_group_events == {}
         assert adapter._media_group_tasks == {}
         adapter.handle_message.assert_not_awaited()
+
+
+class TestForwardedMixedMessageBatch:
+    @pytest.mark.asyncio
+    async def test_forwarded_voice_and_link_are_dispatched_as_one_event(self, adapter):
+        adapter._text_batch_delay_seconds = 0.01
+        adapter._text_batch_split_delay_seconds = 0.02
+        adapter._forward_batch_delay_seconds = 0.05
+
+        forward_origin = SimpleNamespace(type="user")
+        voice_msg = _make_voice_message(_make_file_obj(b"voice"), forward_origin=forward_origin)
+        link_msg = _make_text_message(
+            "https://docs.google.com/document/d/example/edit",
+            forward_origin=forward_origin,
+        )
+
+        with patch("gateway.platforms.telegram.cache_audio_from_bytes", return_value="/tmp/voice.ogg"):
+            await adapter._handle_media_message(_make_update(voice_msg), MagicMock())
+            adapter.handle_message.assert_not_awaited()
+
+            await adapter._handle_text_message(_make_update(link_msg), MagicMock())
+            await asyncio.sleep(0.08)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == ["/tmp/voice.ogg"]
+        assert event.media_types == ["audio/ogg"]
+        assert event.text == "https://docs.google.com/document/d/example/edit"
 
 
 # ---------------------------------------------------------------------------

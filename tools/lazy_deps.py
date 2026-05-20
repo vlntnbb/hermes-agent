@@ -111,6 +111,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
+    "stt.gigaam": ("gigaam==0.1.0",),
 
     # ─── Image generation backends ─────────────────────────────────────────
     "image.fal": ("fal-client==0.13.1",),

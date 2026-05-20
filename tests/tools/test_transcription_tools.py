@@ -51,6 +51,11 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+    monkeypatch.delenv("GIGAAM_MODEL", raising=False)
+    monkeypatch.delenv("GIGAAM_DEVICE", raising=False)
+    monkeypatch.delenv("GIGAAM_CHUNK_SEC", raising=False)
+    monkeypatch.delenv("GIGAAM_FALLBACK_CHUNKING", raising=False)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
 
 
 # ============================================================================
@@ -119,6 +124,23 @@ class TestGetProviderFallbackPriority:
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "local"
+
+    def test_explicit_gigaam_is_opt_in(self):
+        from tools.transcription_tools import _get_provider
+        assert _get_provider({"provider": "gigaam"}) == "gigaam"
+
+    def test_auto_detect_does_not_pick_gigaam(self, monkeypatch):
+        """GigaAM may lazy-install packages and download weights, so it is never auto-selected."""
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._has_local_command", return_value=False), \
+             patch("tools.transcription_tools._HAS_OPENAI", False), \
+             patch("tools.transcription_tools._has_openai_audio_backend", return_value=False):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"enabled": True}) == "none"
 
 
 # ============================================================================
@@ -606,6 +628,70 @@ class TestTranscribeLocalExtended:
 
 
 # ============================================================================
+# _transcribe_gigaam
+# ============================================================================
+
+class TestTranscribeGigaAM:
+    def test_model_fallback_maps_v3_to_v2(self):
+        fallback_model = MagicMock()
+
+        with patch(
+            "tools.transcription_tools._load_gigaam_model",
+            side_effect=[RuntimeError("v3 unavailable"), fallback_model],
+        ) as mock_load:
+            from tools.transcription_tools import _load_gigaam_model_with_fallback
+
+            model, resolved = _load_gigaam_model_with_fallback(
+                "v3_e2e_rnnt",
+                "cpu",
+                True,
+                False,
+                None,
+            )
+
+        assert model is fallback_model
+        assert resolved == "v2_rnnt"
+        assert mock_load.call_args_list[0][0][0] == "v3_e2e_rnnt"
+        assert mock_load.call_args_list[1][0][0] == "v2_rnnt"
+
+    def test_successful_short_transcription(self, sample_wav):
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = "  привет мир  "
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={"gigaam": {"device": "cpu"}}), \
+             patch("tools.transcription_tools._prepare_gigaam_audio", return_value=(sample_wav, None)), \
+             patch("tools.transcription_tools._wav_duration_sec", return_value=1.0), \
+             patch("tools.transcription_tools._load_gigaam_model_with_fallback",
+                   return_value=(mock_model, "v2_rnnt")):
+            from tools.transcription_tools import _transcribe_gigaam
+            result = _transcribe_gigaam(sample_wav, "v2_rnnt")
+
+        assert result["success"] is True
+        assert result["provider"] == "gigaam"
+        assert result["transcript"] == "привет мир"
+
+    def test_long_audio_chunks_without_hf_token(self, sample_wav):
+        mock_model = MagicMock()
+        mock_model.transcribe.side_effect = ValueError("Too long wav file")
+
+        with patch("tools.transcription_tools._load_stt_config",
+                   return_value={"gigaam": {"chunk_sec": 10}}), \
+             patch("tools.transcription_tools._find_ffmpeg_binary", return_value="/usr/bin/ffmpeg"), \
+             patch("tools.transcription_tools._prepare_gigaam_audio", return_value=(sample_wav, None)), \
+             patch("tools.transcription_tools._wav_duration_sec", return_value=30.0), \
+             patch("tools.transcription_tools._load_gigaam_model_with_fallback",
+                   return_value=(mock_model, "v2_rnnt")), \
+             patch("tools.transcription_tools._gigaam_chunked_segments",
+                   return_value=[(0.0, 10.0, "первая"), (10.0, 20.0, "вторая")]) as mock_chunks:
+            from tools.transcription_tools import _transcribe_gigaam
+            result = _transcribe_gigaam(sample_wav, "v2_rnnt")
+
+        assert result["success"] is True
+        assert result["transcript"] == "первая вторая"
+        mock_chunks.assert_called_once()
+
+
+# ============================================================================
 # Model auto-correction
 # ============================================================================
 
@@ -823,6 +909,19 @@ class TestTranscribeAudioDispatch:
 
         assert result["success"] is True
         mock_openai.assert_called_once()
+
+    def test_dispatches_to_gigaam(self, sample_ogg):
+        config = {"provider": "gigaam", "gigaam": {"model": "v2_rnnt"}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="gigaam"), \
+             patch("tools.transcription_tools._transcribe_gigaam",
+                   return_value={"success": True, "transcript": "hi", "provider": "gigaam"}) as mock_gigaam:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["provider"] == "gigaam"
+        assert mock_gigaam.call_args[0][1] == "v2_rnnt"
 
     def test_no_provider_returns_error(self, sample_ogg):
         with patch("tools.transcription_tools._load_stt_config", return_value={}), \

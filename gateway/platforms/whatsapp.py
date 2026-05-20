@@ -188,6 +188,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
     cache_audio_from_url,
+    resolve_channel_prompt,
 )
 
 
@@ -1276,6 +1277,11 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 message_id=data.get("messageId"),
                 media_urls=cached_urls,
                 media_types=media_types,
+                channel_prompt=resolve_channel_prompt(
+                    self.config.extra,
+                    source.thread_id or source.chat_id,
+                    source.chat_id if source.thread_id else None,
+                ),
             )
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")

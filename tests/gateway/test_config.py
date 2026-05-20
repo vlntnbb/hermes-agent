@@ -473,6 +473,80 @@ class TestLoadGatewayConfig:
             "C01ABC": "Code review mode",
         }
 
+    def test_chat_standards_adds_telegram_prompt_and_listen_all(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "chat_standards:\n"
+            "  telegram:\n"
+            '    "-1001234567":\n'
+            "      standards: Summarize every decision and action item.\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.TELEGRAM].extra
+
+        assert extra["free_response_chats"] == ["-1001234567"]
+        assert extra["channel_prompts"]["-1001234567"] == (
+            "## Chat Standards\n"
+            "Summarize every decision and action item."
+        )
+
+    def test_chat_standards_list_shape_can_prompt_without_listen_all(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "chat_standards:\n"
+            "  - platform: discord\n"
+            '    channel_id: "123"\n'
+            "    listen: false\n"
+            "    rules:\n"
+            "      - Keep replies short.\n"
+            "      - Never ping roles.\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.DISCORD].extra
+
+        assert "free_response_channels" not in extra
+        assert extra["channel_prompts"]["123"] == (
+            "## Chat Standards\n"
+            "Keep replies short.\n"
+            "Never ping roles."
+        )
+
+    def test_chat_standards_merges_with_existing_free_response(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  free_response_channels: [\"999\"]\n"
+            "  channel_prompts:\n"
+            "    \"999\": Existing prompt\n"
+            "chat_standards:\n"
+            "  discord:\n"
+            "    \"123\": New standards\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.DISCORD].extra
+
+        assert extra["free_response_channels"] == ["999", "123"]
+        assert extra["channel_prompts"]["999"] == "Existing prompt"
+        assert extra["channel_prompts"]["123"] == "## Chat Standards\nNew standards"
+
     def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
