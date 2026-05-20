@@ -13555,7 +13555,7 @@ class GatewayRunner:
         import shutil
         import subprocess
         from datetime import datetime
-        from hermes_cli.config import is_managed, format_managed_message
+        from hermes_cli.config import is_managed, format_managed_message, load_config
 
         # Block non-messaging platforms (API server, webhooks, ACP)
         platform = event.source.platform
@@ -13572,6 +13572,13 @@ class GatewayRunner:
 
         if is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
+
+        updates_cfg = load_config().get("updates", {})
+        if isinstance(updates_cfg, dict) and updates_cfg.get("allow_gateway_update") is False:
+            return (
+                "✗ Gateway /update is disabled by updates.allow_gateway_update=false.\n"
+                "Review local changes, then run `hermes update --rebase-local` manually."
+            )
 
         project_root = Path(__file__).parent.parent.resolve()
         git_dir = project_root / '.git'
@@ -14305,6 +14312,7 @@ class GatewayRunner:
                     )
                 else:
                     error = result.get("error", "unknown error")
+                    cached_path_note = f" Cached audio path: {path}."
                     if (
                         "No STT provider" in error
                         or error.startswith("Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set")
@@ -14321,12 +14329,13 @@ class GatewayRunner:
                                 "that can help users configure Hermes features "
                                 "including voice, tools, and more."
                             )
+                        _no_stt_note += cached_path_note
                         _no_stt_note += "]"
                         enriched_parts.append(_no_stt_note)
                     else:
                         enriched_parts.append(
                             "[The user sent a voice message but I had trouble "
-                            f"transcribing it~ ({error})]"
+                            f"transcribing it~ ({error}).{cached_path_note}]"
                         )
             except Exception as e:
                 logger.error("Transcription error: %s", e)

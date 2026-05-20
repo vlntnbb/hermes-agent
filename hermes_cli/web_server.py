@@ -731,6 +731,15 @@ async def restart_gateway():
 @app.post("/api/hermes/update")
 async def update_hermes():
     """Kick off ``hermes update`` in the background."""
+    updates_cfg = load_config().get("updates", {})
+    if isinstance(updates_cfg, dict) and updates_cfg.get("allow_dashboard_update") is False:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Dashboard updates are disabled by updates.allow_dashboard_update=false. "
+                "Run `hermes update --rebase-local` manually after reviewing local changes."
+            ),
+        )
     try:
         proc = _spawn_hermes_action(["update"], "hermes-update")
     except Exception as exc:

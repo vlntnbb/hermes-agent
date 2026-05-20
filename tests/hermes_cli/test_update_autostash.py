@@ -325,6 +325,8 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
         if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "--count", "origin/main..HEAD"]:
+            return SimpleNamespace(stdout="0\n", stderr="", returncode=0)
         if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[all]"]:
@@ -374,6 +376,8 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
         if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "--count", "origin/main..HEAD"]:
+            return SimpleNamespace(stdout="0\n", stderr="", returncode=0)
         if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -442,6 +446,7 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 def _make_update_side_effect(
     current_branch="main",
     commit_count="3",
+    local_commit_count="0",
     ff_only_fails=False,
     reset_fails=False,
     fetch_fails=False,
@@ -462,6 +467,8 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
+            if "origin/main..HEAD" in joined:
+                return SimpleNamespace(stdout=f"{local_commit_count}\n", stderr="", returncode=0)
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "--ff-only" in joined:
             if ff_only_fails:
@@ -484,6 +491,11 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
     """When --ff-only fails (diverged history), update resets to origin/{branch}."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_load_update_settings",
+        lambda: {"local_changes_policy": "reset"},
+    )
 
     side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
@@ -496,6 +508,45 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
+
+
+def test_cmd_update_blocks_reset_when_policy_is_block(monkeypatch, tmp_path, capsys):
+    """The default safe policy refuses reset --hard on diverged history."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
+    assert reset_calls == []
+
+    out = capsys.readouterr().out
+    assert "Refusing to run `git reset --hard`" in out
+
+
+def test_cmd_update_blocks_when_local_commits_would_be_overwritten(monkeypatch, tmp_path, capsys):
+    """Local commits on main require the explicit --rebase-local path."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    side_effect, recorded = _make_update_side_effect(local_commit_count="2")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    pull_calls = [c for c in recorded if "pull" in c]
+    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
+    assert pull_calls == []
+    assert reset_calls == []
+
+    out = capsys.readouterr().out
+    assert "has 2 commit(s)" in out
+    assert "--rebase-local" in out
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
@@ -644,6 +695,11 @@ def test_cmd_update_auth_error_shows_friendly_message(monkeypatch, tmp_path, cap
 def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, capsys):
     """When reset --hard fails, stash restore is skipped with a helpful message."""
     _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_main,
+        "_load_update_settings",
+        lambda: {"local_changes_policy": "reset"},
+    )
     # Re-enable stash so it actually returns a ref
     monkeypatch.setattr(
         hermes_main, "_stash_local_changes_if_needed",

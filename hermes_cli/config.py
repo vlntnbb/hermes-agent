@@ -1675,6 +1675,17 @@ DEFAULT_CONFIG = {
 
     # ``hermes update`` behaviour.
     "updates": {
+        # Fine-grained switches for the places that can launch an update.
+        # Direct terminal updates stay enabled by default; gateway/dashboard
+        # launches can be disabled locally for installations that carry custom
+        # code patches and should only update after an explicit review.
+        "allow_cli_update": True,
+        "allow_gateway_update": True,
+        "allow_dashboard_update": True,
+        # What to do when git cannot fast-forward cleanly.  ``block`` refuses
+        # the old reset-hard fallback and asks the user to rebase or resolve
+        # manually.  Set to ``reset`` to restore the previous behaviour.
+        "local_changes_policy": "block",
         # Run a full ``hermes backup``-style zip of HERMES_HOME before every
         # ``hermes update``.  Backups land in ``<HERMES_HOME>/backups/`` and
         # can be restored with ``hermes import <path>``.  Off by default —

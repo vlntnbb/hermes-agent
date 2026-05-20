@@ -51,6 +51,37 @@ When you run `hermes update`, the following steps occur:
 
 Want to know if an update is available before pulling? Run `hermes update --check` — for git installs it fetches and compares commits against `origin/main`; for pip installs it queries PyPI for the latest release. No files are modified, no gateway is restarted. Useful in scripts and cron jobs that gate on "is there an update".
 
+### Local code changes and safe updates
+
+If your install carries local Hermes code changes, keep the default safe policy:
+
+```yaml
+# ~/.hermes/config.yaml
+updates:
+  local_changes_policy: block
+```
+
+With this policy, `hermes update` refuses to run `git reset --hard` when git history cannot fast-forward cleanly. If you have local commits that need to survive the update, run:
+
+```bash
+hermes update --rebase-local
+```
+
+This rebases the current local branch on the latest `upstream/main` when an upstream remote exists, otherwise on `origin/main`, then continues the normal dependency, config migration, and gateway restart steps.
+
+You can also disable update launches from chat platforms or the dashboard while keeping explicit terminal updates enabled:
+
+```yaml
+# ~/.hermes/config.yaml
+updates:
+  allow_cli_update: true
+  allow_gateway_update: false
+  allow_dashboard_update: false
+  local_changes_policy: block
+```
+
+Use this when updates should only happen after you have reviewed local patches and intentionally run `hermes update --rebase-local` from the repository.
+
 ### Full pre-update backup: `--backup`
 
 For high-value profiles (production gateways, shared team installs) you can opt into a full pre-pull backup of `HERMES_HOME` (config, auth, sessions, skills, pairing):
