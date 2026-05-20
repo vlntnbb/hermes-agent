@@ -57,6 +57,20 @@ class TestHandleUpdateCommand:
         assert "brew upgrade hermes-agent" in result
 
     @pytest.mark.asyncio
+    async def test_config_can_disable_gateway_update(self):
+        runner = _make_runner()
+        event = _make_event()
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"updates": {"allow_gateway_update": False}},
+        ):
+            result = await runner._handle_update_command(event)
+
+        assert "Gateway /update is disabled" in result
+        assert "allow_gateway_update=false" in result
+
+    @pytest.mark.asyncio
     async def test_no_git_directory(self, tmp_path):
         """Returns an error when .git does not exist."""
         runner = _make_runner()

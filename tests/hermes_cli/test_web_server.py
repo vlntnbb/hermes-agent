@@ -153,6 +153,25 @@ class TestWebServerEndpoints:
         assert "hermes_home" in data
         assert "active_sessions" in data
 
+    def test_dashboard_update_can_be_disabled(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"updates": {"allow_dashboard_update": False}},
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_spawn_hermes_action",
+            lambda *a, **kw: pytest.fail("dashboard update should be blocked"),
+        )
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 403
+        assert "allow_dashboard_update=false" in resp.json()["detail"]
+
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
 
