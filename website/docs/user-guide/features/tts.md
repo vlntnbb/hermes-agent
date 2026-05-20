@@ -384,6 +384,7 @@ Voice messages sent on Telegram, Discord, WhatsApp, Slack, or Signal are automat
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------| 
 | **Local Whisper** (default) | Good | Free | None needed |
+| **GigaAM** | Best for Russian | Free/local | None needed |
 | **Groq Whisper API** | Good–Best | Free tier | `GROQ_API_KEY` |
 | **OpenAI Whisper API** | Good–Best | Paid | `VOICE_TOOLS_OPENAI_KEY` or `OPENAI_API_KEY` |
 
@@ -396,9 +397,13 @@ Local transcription works out of the box when `faster-whisper` is installed. If 
 ```yaml
 # In ~/.hermes/config.yaml
 stt:
-  provider: "local"           # "local" | "groq" | "openai" | "mistral" | "xai"
+  provider: "local"           # "local" | "gigaam" | "groq" | "openai" | "mistral" | "xai"
   local:
     model: "base"             # tiny, base, small, medium, large-v3
+  gigaam:
+    model: "v3_e2e_rnnt"      # v3_e2e_rnnt, v3_e2e_ctc, v2_rnnt, v2_ctc
+    device: "cpu"             # cpu, cuda, mps
+    chunk_sec: 20             # chunk size for long audio
   openai:
     model: "whisper-1"        # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
   mistral:
@@ -422,6 +427,8 @@ stt:
 **Groq API** — Requires `GROQ_API_KEY`. Good cloud fallback when you want a free hosted STT option.
 
 **OpenAI API** — Accepts `VOICE_TOOLS_OPENAI_KEY` first and falls back to `OPENAI_API_KEY`. Supports `whisper-1`, `gpt-4o-mini-transcribe`, and `gpt-4o-transcribe`.
+
+**GigaAM** — Local Russian ASR via the `gigaam` package. Hermes prepares 16 kHz mono WAV with `ffmpeg`, tries v3 GigaAM models first, falls back to v2 where v3 is not installed, and chunks long audio when native short-form transcription rejects the file. Set `stt.provider: gigaam` explicitly to use it.
 
 **Mistral API (Voxtral Transcribe)** — Requires `MISTRAL_API_KEY`. Uses Mistral's [Voxtral Transcribe](https://docs.mistral.ai/capabilities/audio/speech_to_text/) models. Supports 13 languages, speaker diarization, and word-level timestamps. Install with `pip install hermes-agent[mistral]`.
 

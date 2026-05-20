@@ -144,6 +144,7 @@ def _build_provider_env_blocklist() -> frozenset:
         "FIREWORKS_API_KEY",
         "XAI_API_KEY",
         "HELICONE_API_KEY",
+        "HF_TOKEN",
         "PARALLEL_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",

@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with seven providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -12,6 +12,8 @@ Provides speech-to-text transcription with six providers:
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
   - **elevenlabs** — ElevenLabs Scribe API, requires ``ELEVENLABS_API_KEY``.
+  - **gigaam** — local GigaAM model for Russian speech, no API key needed.
+    Requires the ``gigaam`` package and ``ffmpeg`` for non-WAV inputs.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -33,6 +35,9 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
+import wave
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -90,6 +95,7 @@ DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
 DEFAULT_ELEVENLABS_STT_MODEL = os.getenv("STT_ELEVENLABS_MODEL", "scribe_v2")
+DEFAULT_GIGAAM_STT_MODEL = "v3_e2e_rnnt"
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -106,6 +112,13 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
+GIGAAM_MODEL_ALIASES = {"rnnt": "v2_rnnt", "ctc": "v2_ctc"}
+GIGAAM_FALLBACK_MODELS = {
+    "v3_e2e_rnnt": "v2_rnnt",
+    "v3_rnnt": "v2_rnnt",
+    "v3_e2e_ctc": "v2_ctc",
+    "v3_ctc": "v2_ctc",
+}
 
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
@@ -778,6 +791,9 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "gigaam":
+            return "gigaam"
+
         if provider == "groq":
             if _HAS_OPENAI and get_env_value("GROQ_API_KEY"):
                 return "groq"
@@ -823,7 +839,9 @@ def _get_provider(stt_config: dict) -> str:
 
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > xai > elevenlabs -
+    # --- Auto-detect (no explicit provider): local > groq > openai > xai > elevenlabs ---
+    # GigaAM is opt-in only: loading it can lazily install a package and
+    # download large model weights, so do not select it implicitly.
     # mistral is intentionally skipped while `mistralai` is quarantined on
     # PyPI (malicious 2.4.6 release on 2026-05-12).
 
@@ -1261,6 +1279,348 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
         logger.error("Unexpected error during local command transcription: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
 
+
+# ---------------------------------------------------------------------------
+# Provider: GigaAM (local Russian ASR)
+# ---------------------------------------------------------------------------
+
+
+def _first_config_or_env(
+    config: Dict[str, Any],
+    key: str,
+    env_names: tuple[str, ...],
+    default: Any = None,
+) -> Any:
+    if key in config:
+        value = config.get(key)
+        if value not in (None, ""):
+            return value
+    for env_name in env_names:
+        value = get_env_value(env_name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _normalize_gigaam_model_name(model_name: Optional[str]) -> str:
+    model_name = (model_name or "").strip() or DEFAULT_GIGAAM_STT_MODEL
+    return GIGAAM_MODEL_ALIASES.get(model_name, model_name)
+
+
+def _gigaam_chunk_sec(gigaam_config: Dict[str, Any]) -> float:
+    raw = _first_config_or_env(gigaam_config, "chunk_sec", ("GIGAAM_CHUNK_SEC",), 20.0)
+    try:
+        chunk_sec = float(raw)
+    except (TypeError, ValueError):
+        chunk_sec = 20.0
+    return min(24.0, max(5.0, chunk_sec))
+
+
+def _wav_duration_sec(wav_path: str) -> float:
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or 0
+            if rate <= 0:
+                return 0.0
+            return float(frames) / float(rate)
+    except Exception:
+        return 0.0
+
+
+def _prepare_gigaam_audio(file_path: str, work_dir: str, ffmpeg_bin: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Convert input media to 16 kHz mono WAV for GigaAM."""
+    audio_path = Path(file_path)
+    if not ffmpeg_bin:
+        if audio_path.suffix.lower() == ".wav":
+            return file_path, None
+        return None, "GigaAM STT requires ffmpeg for non-WAV inputs, but ffmpeg was not found"
+
+    converted_path = os.path.join(work_dir, f"{audio_path.stem}.gigaam.wav")
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        file_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        converted_path,
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        return converted_path, None
+    except subprocess.CalledProcessError as e:
+        details = e.stderr.strip() or e.stdout.strip() or str(e)
+        logger.error("ffmpeg conversion failed for GigaAM STT (%s): %s", file_path, details)
+        return None, f"Failed to convert audio for GigaAM STT: {details}"
+
+
+def _ffmpeg_wav_chunk(
+    *,
+    src_wav: str,
+    dst_wav: str,
+    start_sec: float,
+    dur_sec: float,
+    ffmpeg_bin: str,
+) -> None:
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-ss",
+        f"{max(0.0, float(start_sec)):.3f}",
+        "-t",
+        f"{max(0.0, float(dur_sec)):.3f}",
+        "-i",
+        src_wav,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        dst_wav,
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+
+def _ensure_gigaam_available() -> None:
+    try:
+        from tools.lazy_deps import ensure
+    except Exception:
+        return
+    ensure("stt.gigaam", prompt=False)
+
+
+@lru_cache(maxsize=4)
+def _load_gigaam_model(
+    model_name: str,
+    device: str,
+    fp16_encoder: bool,
+    use_flash: bool,
+    download_root: Optional[str],
+):
+    _ensure_gigaam_available()
+    from gigaam import load_model
+
+    return load_model(
+        model_name=model_name,
+        device=device,
+        fp16_encoder=fp16_encoder,
+        use_flash=use_flash,
+        download_root=download_root,
+    )
+
+
+def _load_gigaam_model_with_fallback(
+    requested_model: str,
+    device: str,
+    fp16_encoder: bool,
+    use_flash: bool,
+    download_root: Optional[str],
+) -> tuple[Any, str]:
+    model_name = _normalize_gigaam_model_name(requested_model)
+    try:
+        model = _load_gigaam_model(model_name, device, fp16_encoder, use_flash, download_root)
+        return model, model_name
+    except Exception as exc:
+        fallback_name = GIGAAM_FALLBACK_MODELS.get(model_name)
+        if not fallback_name:
+            raise
+        logger.warning(
+            "GigaAM model '%s' is unavailable in this install (%s). "
+            "Falling back to '%s' without v3 punctuation.",
+            model_name,
+            exc,
+            fallback_name,
+        )
+        model = _load_gigaam_model(fallback_name, device, fp16_encoder, use_flash, download_root)
+        return model, fallback_name
+
+
+def _gigaam_longform_segments(model: Any, wav_path: str) -> list[tuple[float, float, str]]:
+    parts = model.transcribe_longform(wav_path)
+    segments: list[tuple[float, float, str]] = []
+    texts: list[str] = []
+    for part in parts or []:
+        text = str((part or {}).get("transcription") or "").strip()
+        boundaries = (part or {}).get("boundaries")
+        if text:
+            texts.append(text)
+        if isinstance(boundaries, (tuple, list)) and len(boundaries) == 2:
+            try:
+                start = float(boundaries[0])
+                end = float(boundaries[1])
+            except (TypeError, ValueError):
+                start, end = 0.0, 0.0
+            segments.append((start, end, text))
+    if segments:
+        return segments
+    full_text = " ".join(texts).strip()
+    return [(0.0, _wav_duration_sec(wav_path), full_text)]
+
+
+def _gigaam_chunked_segments(
+    model: Any,
+    wav_path: str,
+    *,
+    duration: float,
+    chunk_sec: float,
+    ffmpeg_bin: str,
+) -> list[tuple[float, float, str]]:
+    segments: list[tuple[float, float, str]] = []
+    with tempfile.TemporaryDirectory(prefix="hermes-gigaam-chunks-") as chunk_dir:
+        t = 0.0
+        idx = 0
+        while t < max(duration, 0.001):
+            part_duration = min(chunk_sec, max(0.0, duration - t))
+            if part_duration <= 0.01:
+                break
+            chunk_path = os.path.join(chunk_dir, f"chunk_{idx:04d}.wav")
+            _ffmpeg_wav_chunk(
+                src_wav=wav_path,
+                dst_wav=chunk_path,
+                start_sec=t,
+                dur_sec=part_duration,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+            text = str(model.transcribe(chunk_path) or "").strip()
+            segments.append((t, min(duration, t + part_duration), text))
+            t += part_duration
+            idx += 1
+    return segments
+
+
+def _segments_text(segments: list[tuple[float, float, str]]) -> str:
+    return " ".join(text.strip() for _start, _end, text in segments if text and text.strip()).strip()
+
+
+def _transcribe_gigaam(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using local GigaAM.
+
+    The implementation follows the local Content Agent transcriber: normalize
+    inputs to 16 kHz mono WAV, prefer the requested v3 model, fall back to v2
+    when the installed package does not expose v3 weights, then use long-form
+    or short chunked transcription for audio longer than GigaAM's native limit.
+    """
+    stt_config = _load_stt_config()
+    gigaam_config = stt_config.get("gigaam", {}) if isinstance(stt_config.get("gigaam"), dict) else {}
+    device = str(_first_config_or_env(gigaam_config, "device", ("GIGAAM_DEVICE", "DEVICE"), "cpu")).strip() or "cpu"
+    hf_token = _first_config_or_env(gigaam_config, "hf_token", ("HF_TOKEN",), None)
+    hf_token = str(hf_token).strip() if hf_token else None
+    fp16_encoder = is_truthy_value(
+        _first_config_or_env(gigaam_config, "fp16_encoder", ("GIGAAM_FP16_ENCODER",), True),
+        default=True,
+    )
+    use_flash = is_truthy_value(
+        _first_config_or_env(gigaam_config, "use_flash", ("GIGAAM_USE_FLASH",), False),
+        default=False,
+    )
+    download_root = _first_config_or_env(gigaam_config, "download_root", ("GIGAAM_DOWNLOAD_ROOT",), None)
+    download_root = str(download_root).strip() if download_root else None
+    fallback_chunking = is_truthy_value(
+        _first_config_or_env(gigaam_config, "fallback_chunking", ("GIGAAM_FALLBACK_CHUNKING",), False),
+        default=False,
+    )
+    ffmpeg_bin = str(
+        _first_config_or_env(gigaam_config, "ffmpeg_bin", ("GIGAAM_FFMPEG_BIN", "FFMPEG_BIN"), "")
+        or _find_ffmpeg_binary()
+        or ""
+    ).strip()
+
+    if hf_token:
+        os.environ.setdefault("HF_TOKEN", hf_token)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-gigaam-stt-") as work_dir:
+            wav_path, prep_error = _prepare_gigaam_audio(file_path, work_dir, ffmpeg_bin or None)
+            if prep_error:
+                return {"success": False, "transcript": "", "error": prep_error}
+
+            model, resolved_model = _load_gigaam_model_with_fallback(
+                model_name,
+                device,
+                fp16_encoder,
+                use_flash,
+                download_root,
+            )
+            duration = _wav_duration_sec(wav_path)
+            started = time.monotonic()
+
+            try:
+                text = str(model.transcribe(wav_path) or "").strip()
+                segments = [(0.0, duration, text)]
+                mode = "short"
+            except ValueError as exc:
+                if "Too long wav file" not in str(exc):
+                    raise
+                if hf_token:
+                    try:
+                        segments = _gigaam_longform_segments(model, wav_path)
+                        mode = "longform"
+                    except Exception as longform_exc:
+                        if not fallback_chunking:
+                            raise RuntimeError(
+                                "GigaAM long-form failed. Check HF_TOKEN access to "
+                                "pyannote/voice-activity-detection and pyannote/segmentation, "
+                                "install gigaam[longform], or enable stt.gigaam.fallback_chunking."
+                            ) from longform_exc
+                        logger.warning("GigaAM long-form failed, falling back to chunking: %s", longform_exc)
+                        if not ffmpeg_bin:
+                            return {
+                                "success": False,
+                                "transcript": "",
+                                "error": "GigaAM chunking fallback requires ffmpeg, but ffmpeg was not found",
+                            }
+                        chunk_sec = _gigaam_chunk_sec(gigaam_config)
+                        segments = _gigaam_chunked_segments(
+                            model,
+                            wav_path,
+                            duration=duration,
+                            chunk_sec=chunk_sec,
+                            ffmpeg_bin=ffmpeg_bin,
+                        )
+                        mode = "chunking"
+                else:
+                    if not ffmpeg_bin:
+                        return {
+                            "success": False,
+                            "transcript": "",
+                            "error": "GigaAM long audio requires ffmpeg for chunking, but ffmpeg was not found",
+                        }
+                    chunk_sec = _gigaam_chunk_sec(gigaam_config)
+                    segments = _gigaam_chunked_segments(
+                        model,
+                        wav_path,
+                        duration=duration,
+                        chunk_sec=chunk_sec,
+                        ffmpeg_bin=ffmpeg_bin,
+                    )
+                    mode = "chunking"
+
+            transcript_text = _segments_text(segments)
+            logger.info(
+                "Transcribed %s via GigaAM (%s, mode=%s, %.1fs audio, %.1fs wall, %d chars)",
+                Path(file_path).name,
+                resolved_model,
+                mode,
+                duration,
+                time.monotonic() - started,
+                len(transcript_text),
+            )
+            return {"success": True, "transcript": transcript_text, "provider": "gigaam"}
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("GigaAM transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"GigaAM transcription failed: {e}"}
+
 # ---------------------------------------------------------------------------
 # Provider: groq (Whisper API — free tier)
 # ---------------------------------------------------------------------------
@@ -1618,7 +1978,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     Provider priority:
       1. User config (``stt.provider`` in config.yaml)
-      2. Auto-detect: local > Groq > OpenAI > Mistral > xAI > ElevenLabs
+      2. Auto-detect: local faster-whisper (free) > Groq (free tier) > OpenAI (paid) > xAI > ElevenLabs
+         GigaAM is opt-in via ``stt.provider: gigaam``.
 
     Args:
         file_path: Absolute path to the audio file to transcribe.
@@ -1660,6 +2021,18 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
         return _transcribe_local_command(file_path, model_name)
+
+    if provider == "gigaam":
+        gigaam_cfg = stt_config.get("gigaam", {})
+        if not isinstance(gigaam_cfg, dict):
+            gigaam_cfg = {}
+        model_name = _normalize_gigaam_model_name(
+            model
+            or gigaam_cfg.get("model")
+            or get_env_value("GIGAAM_MODEL")
+            or DEFAULT_GIGAAM_STT_MODEL
+        )
+        return _transcribe_gigaam(file_path, model_name)
 
     if provider == "groq":
         model_name = model or DEFAULT_GROQ_STT_MODEL
@@ -1734,9 +2107,10 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         "error": (
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
-            "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
-            "set ELEVENLABS_API_KEY for ElevenLabs Scribe, or set VOICE_TOOLS_OPENAI_KEY "
+            "set stt.provider: gigaam for local Russian GigaAM, set GROQ_API_KEY for free "
+            "Groq Whisper, set MISTRAL_API_KEY for Mistral Voxtral Transcribe, configure "
+            "xAI OAuth or set XAI_API_KEY for xAI Grok STT, set ELEVENLABS_API_KEY for "
+            "ElevenLabs Scribe, or set VOICE_TOOLS_OPENAI_KEY "
             "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }

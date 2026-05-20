@@ -520,6 +520,29 @@ session_reset:
 # explicitly want one shared "room brain" per group/channel.
 group_sessions_per_user: true
 
+# Per-chat standards for group/channel monitoring.
+# Each configured chat is added to the platform's listen-all/free-response list
+# by default, so Hermes reads every message there without needing @mentions.
+# Set listen: false when you only want the rules applied after a normal trigger.
+#
+# Supported listen-all targets:
+#   telegram/whatsapp/dingtalk: free_response_chats
+#   discord/slack/mattermost:   free_response_channels
+#   matrix:                     free_response_rooms
+#
+# chat_standards:
+#   telegram:
+#     "-1001234567890":
+#       standards: |
+#         Track every message for decisions, blockers, and follow-ups.
+#         When responding, include only the new decision or follow-up.
+#   discord:
+#     "123456789012345678":
+#       listen: true
+#       standards: |
+#         Treat this channel as an engineering triage room.
+#         Be concise and always include an owner and next action when summarizing.
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gateway Streaming
 # ─────────────────────────────────────────────────────────────────────────────
@@ -816,14 +839,20 @@ platform_toolsets:
 # Voice Transcription (Speech-to-Text)
 # =============================================================================
 # Automatically transcribe voice messages on messaging platforms.
-# Providers: local (free, faster-whisper) | groq (free tier) | openai (Whisper API) | mistral (Voxtral Transcribe)
-# Set the corresponding API key in .env: GROQ_API_KEY, OPENAI_API_KEY, or MISTRAL_API_KEY.
+# Providers: local (free, faster-whisper) | gigaam (local Russian) | groq (free tier) | openai (Whisper API) | mistral (Voxtral Transcribe) | xai
+# Set the corresponding API key in .env for cloud providers: GROQ_API_KEY, OPENAI_API_KEY, MISTRAL_API_KEY, or XAI_API_KEY.
 stt:
   enabled: true
   # provider: "local"          # auto-detected if omitted
   local:
     model: "base"              # tiny | base | small | medium | large-v3 | turbo
     # language: ""             # auto-detect; set to "en", "es", "fr", etc. to force
+  gigaam:
+    model: "v3_e2e_rnnt"       # v3_e2e_rnnt | v3_e2e_ctc | v2_rnnt | v2_ctc
+    device: "cpu"              # cpu | cuda | mps
+    chunk_sec: 20              # long audio chunk size when long-form is unavailable
+    fallback_chunking: false   # if HF_TOKEN long-form fails, fall back to chunks
+    # hf_token: ""             # optional Hugging Face token for long-form VAD
   openai:
     model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
   # mistral:

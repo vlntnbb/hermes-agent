@@ -94,6 +94,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    resolve_channel_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -691,6 +692,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             timestamp=timestamp,
+            channel_prompt=resolve_channel_prompt(self.config.extra, chat_id, None),
         )
 
         logger.debug(

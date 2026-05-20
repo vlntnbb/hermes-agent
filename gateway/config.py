@@ -199,6 +199,188 @@ class Platform(Enum):
 _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.values())
 
 
+_CHAT_STANDARDS_LISTEN_KEYS = {
+    "telegram": "free_response_chats",
+    "whatsapp": "free_response_chats",
+    "dingtalk": "free_response_chats",
+    "discord": "free_response_channels",
+    "slack": "free_response_channels",
+    "mattermost": "free_response_channels",
+    "matrix": "free_response_rooms",
+}
+
+_CHAT_STANDARDS_PROMPT_KEYS = (
+    "prompt",
+    "standards",
+    "standard",
+    "rules",
+    "instructions",
+    "system_prompt",
+)
+
+_CHAT_STANDARDS_ID_KEYS = ("chat_id", "channel_id", "room_id", "id")
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    """Coerce comma-separated strings or sequences into stripped string items."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = str(value).split(",")
+    result: list[str] = []
+    for item in values:
+        text = str(item).strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _merge_string_list(existing: Any, additions: list[str]) -> list[str]:
+    """Merge ID lists while preserving first-seen order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in _coerce_string_list(existing) + _coerce_string_list(additions):
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _chat_standards_prompt(entry: Any) -> Optional[str]:
+    """Extract the per-chat standards prompt from a chat_standards entry."""
+    value: Any = entry
+    if isinstance(entry, dict):
+        value = None
+        for key in _CHAT_STANDARDS_PROMPT_KEYS:
+            if key in entry:
+                value = entry.get(key)
+                break
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        lines = [str(part).strip() for part in value if str(part).strip()]
+        text = "\n".join(lines)
+    else:
+        text = str(value).strip()
+    return text or None
+
+
+def _format_chat_standards_prompt(prompt: str) -> str:
+    """Wrap chat standards so they are clearly separated in the system prompt."""
+    prompt = prompt.strip()
+    if prompt.startswith("## Chat Standards"):
+        return prompt
+    return f"## Chat Standards\n{prompt}"
+
+
+def _chat_standards_entry_enabled(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return True
+    return _coerce_bool(entry.get("enabled"), True)
+
+
+def _chat_standards_listen_enabled(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return True
+    for key in ("listen", "listen_all", "process_all_messages"):
+        if key in entry:
+            return _coerce_bool(entry.get(key), True)
+    return True
+
+
+def _chat_standards_ids_from_entry(entry: dict) -> list[str]:
+    for key in _CHAT_STANDARDS_ID_KEYS:
+        if key in entry:
+            return _coerce_string_list(entry.get(key))
+    return []
+
+
+def _iter_chat_standards(raw: Any):
+    """Yield ``(platform_name, chat_id, entry)`` triples from supported shapes.
+
+    Supported YAML:
+
+        chat_standards:
+          telegram:
+            "-100123": {standards: "..."}
+          - platform: discord
+            channel_id: "123"
+            standards: "..."
+    """
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            platform_name = str(entry.get("platform") or "").strip().lower()
+            if not platform_name:
+                continue
+            for chat_id in _chat_standards_ids_from_entry(entry):
+                yield platform_name, chat_id, entry
+        return
+
+    if not isinstance(raw, dict):
+        return
+
+    for platform_name, entries in raw.items():
+        platform_name = str(platform_name or "").strip().lower()
+        if not platform_name:
+            continue
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for chat_id in _chat_standards_ids_from_entry(entry):
+                    yield platform_name, chat_id, entry
+            continue
+        if not isinstance(entries, dict):
+            continue
+        for chat_id, entry in entries.items():
+            chat_id_str = str(chat_id).strip()
+            if chat_id_str:
+                yield platform_name, chat_id_str, entry
+
+
+def _apply_chat_standards_config(yaml_cfg: dict, platforms_data: dict) -> None:
+    """Bridge top-level chat_standards/chat_rules into platform extras."""
+    raw = yaml_cfg.get("chat_standards")
+    if raw is None:
+        raw = yaml_cfg.get("chat_rules")
+    if raw is None:
+        return
+
+    for platform_name, chat_id, entry in _iter_chat_standards(raw):
+        try:
+            platform = Platform(platform_name)
+        except ValueError:
+            logger.warning("Ignoring chat_standards for unknown platform %r", platform_name)
+            continue
+        if not _chat_standards_entry_enabled(entry):
+            continue
+
+        _plat_data, extra = _ensure_platform_extra_dict(platforms_data, platform.value)
+
+        prompt = _chat_standards_prompt(entry)
+        if prompt:
+            prompts = extra.setdefault("channel_prompts", {})
+            if not isinstance(prompts, dict):
+                prompts = {}
+                extra["channel_prompts"] = prompts
+            prompts[str(chat_id)] = _format_chat_standards_prompt(prompt)
+
+        if _chat_standards_listen_enabled(entry):
+            listen_key = _CHAT_STANDARDS_LISTEN_KEYS.get(platform.value)
+            if not listen_key:
+                logger.warning(
+                    "chat_standards listen=true is not supported for platform %r",
+                    platform.value,
+                )
+                continue
+            extra[listen_key] = _merge_string_list(extra.get(listen_key), [chat_id])
+
+
 @dataclass
 class HomeChannel:
     """
@@ -862,8 +1044,13 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allowed_chats"] = platform_cfg["group_allowed_chats"]
                 if plat == Platform.TELEGRAM and "allowed_topics" in platform_cfg:
                     bridged["allowed_topics"] = platform_cfg["allowed_topics"]
-                if "free_response_channels" in platform_cfg:
-                    bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                for _free_response_key in (
+                    "free_response_channels",
+                    "free_response_chats",
+                    "free_response_rooms",
+                ):
+                    if _free_response_key in platform_cfg:
+                        bridged[_free_response_key] = platform_cfg[_free_response_key]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
@@ -905,6 +1092,8 @@ def load_gateway_config() -> GatewayConfig:
                 if plat == Platform.SLACK and enabled_was_explicit:
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
+
+            _apply_chat_standards_config(yaml_cfg, platforms_data)
 
             # Plugin-owned YAML→env config bridges (#24836).  See
             # ``PlatformEntry.apply_yaml_config_fn`` for the hook contract.

@@ -158,6 +158,7 @@ class TestProviderEnvBlocklist:
             "FIREWORKS_API_KEY": "fireworks-key",
             "XAI_API_KEY": "xai-key",
             "HELICONE_API_KEY": "helicone-key",
+            "HF_TOKEN": "hf-secret",
         }
         result_env = _run_with_env(extra_os_env=extra_provider_vars)
 

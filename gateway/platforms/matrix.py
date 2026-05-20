@@ -101,6 +101,7 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
     resolve_proxy_url,
+    resolve_channel_prompt,
     proxy_kwargs_for_aiohttp,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
@@ -410,11 +411,20 @@ class MatrixAdapter(BasePlatformAdapter):
         # Thread participation tracking (for require_mention bypass)
         self._threads = ThreadParticipationTracker("matrix")
 
-        # Mention/thread gating — parsed once from env vars.
-        self._require_mention: bool = os.getenv(
-            "MATRIX_REQUIRE_MENTION", "true"
-        ).lower() not in {"false", "0", "no"}
-        self._thread_require_mention: bool = self._parse_thread_require_mention(config)
+        # Mention/thread gating — parsed once from config/env vars.
+        require_mention_raw = config.extra.get("require_mention")
+        if require_mention_raw is None:
+            require_mention_raw = os.getenv("MATRIX_REQUIRE_MENTION", "true")
+        if isinstance(require_mention_raw, str):
+            self._require_mention = require_mention_raw.lower() not in {
+                "false",
+                "0",
+                "no",
+                "off",
+            }
+        else:
+            self._require_mention = bool(require_mention_raw)
+        self._thread_require_mention = self._parse_thread_require_mention(config)
         free_rooms_raw = config.extra.get("free_response_rooms")
         if free_rooms_raw is None:
             free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
@@ -1861,6 +1871,11 @@ class MatrixAdapter(BasePlatformAdapter):
             raw_message=source_content,
             message_id=event_id,
             reply_to_message_id=reply_to,
+            channel_prompt=resolve_channel_prompt(
+                self.config.extra,
+                thread_id or room_id,
+                room_id if thread_id else None,
+            ),
         )
 
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
@@ -2043,6 +2058,11 @@ class MatrixAdapter(BasePlatformAdapter):
             message_id=event_id,
             media_urls=media_urls,
             media_types=media_types,
+            channel_prompt=resolve_channel_prompt(
+                self.config.extra,
+                thread_id or room_id,
+                room_id if thread_id else None,
+            ),
         )
 
         await self.handle_message(msg_event)
