@@ -31,10 +31,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -50,6 +52,12 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    SUPPORTED_DOCUMENT_TYPES,
+    SUPPORTED_VIDEO_TYPES,
+    get_audio_cache_dir,
+    get_document_cache_dir,
+    get_image_cache_dir,
+    get_video_cache_dir,
     resolve_channel_prompt,
     utf16_len,
 )
@@ -60,6 +68,57 @@ logger = logging.getLogger("gateway.platforms.telegram_user")
 
 # Register the dynamic enum member at import time for tests and config parsing.
 Platform("telegram_user")
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_IMAGE_MIME_TO_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+_IMAGE_EXT_TO_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+_AUDIO_EXTENSIONS = {
+    ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg",
+    ".opus", ".wav", ".webm",
+}
+_AUDIO_MIME_TO_EXT = {
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/m4a": ".m4a",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/mpga": ".mpga",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".ogg",
+    "audio/wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-aac": ".aac",
+    "audio/x-flac": ".flac",
+    "audio/x-m4a": ".m4a",
+    "audio/x-wav": ".wav",
+}
+_AUDIO_EXT_TO_MIME = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpga",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
 
 
 TELETHON_AVAILABLE = False
@@ -155,6 +214,128 @@ def _identifier_variants(value: Any) -> set[str]:
     else:
         variants.add(f"@{raw}")
     return variants
+
+
+def _normalize_ext(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if not raw.startswith("."):
+        raw = f".{raw}"
+    return raw
+
+
+def _safe_ext(value: Any, fallback: str = "") -> str:
+    ext = _normalize_ext(value) or _normalize_ext(fallback)
+    if not ext or not re.fullmatch(r"\.[a-z0-9][a-z0-9]{0,15}", ext):
+        return ""
+    return ext
+
+
+def _sanitize_cache_filename(value: Any, fallback: str = "telegram_user_attachment") -> str:
+    name = Path(str(value or "")).name
+    name = name.replace("\x00", "").strip()
+    name = re.sub(r"[\x00-\x1f\x7f/\\:]", "_", name)
+    return name if name and name not in {".", ".."} else fallback
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _looks_like_cached_image(path: Path) -> bool:
+    try:
+        header = path.read_bytes()[:12]
+    except OSError:
+        return False
+    return (
+        header.startswith(b"\x89PNG\r\n\x1a\n")
+        or header.startswith(b"\xff\xd8\xff")
+        or header.startswith(b"GIF87a")
+        or header.startswith(b"GIF89a")
+        or header.startswith(b"BM")
+        or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
+    )
+
+
+def _document_attribute_filename(document: Any) -> str:
+    for attr in getattr(document, "attributes", []) or []:
+        filename = getattr(attr, "file_name", None)
+        if filename:
+            return str(filename)
+    return ""
+
+
+def _message_file_info(message: Any) -> tuple[str, str, str]:
+    """Return ``(filename, ext, mime_type)`` for a Telethon message."""
+    file_info = getattr(message, "file", None)
+    document = getattr(message, "document", None)
+
+    filename = str(getattr(file_info, "name", None) or "").strip()
+    if not filename:
+        filename = _document_attribute_filename(document)
+
+    ext = _normalize_ext(getattr(file_info, "ext", None))
+    if not ext and filename:
+        ext = _normalize_ext(Path(filename).suffix)
+
+    mime_type = str(
+        getattr(file_info, "mime_type", None)
+        or getattr(document, "mime_type", None)
+        or getattr(message, "mime_type", None)
+        or ""
+    ).strip().lower()
+
+    if not ext and mime_type:
+        ext = _IMAGE_MIME_TO_EXT.get(mime_type, "")
+        if not ext:
+            ext = _AUDIO_MIME_TO_EXT.get(mime_type, "")
+        if not ext:
+            video_mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
+            ext = video_mime_to_ext.get(mime_type, "")
+        if not ext:
+            doc_mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
+            ext = doc_mime_to_ext.get(mime_type, "")
+
+    if not mime_type and filename:
+        mime_type = (mimetypes.guess_type(filename)[0] or "").lower()
+    if not filename:
+        filename = f"telegram_user_attachment{ext or ''}"
+
+    return filename, ext, mime_type
+
+
+def _media_cache_target(
+    message_type: MessageType,
+    filename: str,
+    ext: str,
+) -> Path:
+    safe_ext = _safe_ext(ext)
+    token = uuid.uuid4().hex[:12]
+
+    if message_type == MessageType.PHOTO:
+        cache_dir = get_image_cache_dir()
+        target = cache_dir / f"img_{token}{safe_ext or '.jpg'}"
+    elif message_type in {MessageType.AUDIO, MessageType.VOICE}:
+        cache_dir = get_audio_cache_dir()
+        target = cache_dir / f"audio_{token}{safe_ext or '.ogg'}"
+    elif message_type == MessageType.VIDEO:
+        cache_dir = get_video_cache_dir()
+        target = cache_dir / f"video_{token}{safe_ext or '.mp4'}"
+    else:
+        cache_dir = get_document_cache_dir()
+        safe_name = _sanitize_cache_filename(filename)
+        if safe_ext and not Path(safe_name).suffix:
+            safe_name = f"{safe_name}{safe_ext}"
+        target = cache_dir / f"doc_{token}_{safe_name}"
+
+    if not _path_is_within(target, cache_dir):
+        raise ValueError(f"Unsafe Telegram User media cache path: {target}")
+    return target
 
 
 def _default_session_path() -> Path:
@@ -1180,6 +1361,185 @@ class TelegramUserAdapter(BasePlatformAdapter):
             return False
         return str(getattr(replied, "sender_id", "") or "") == self._account_user_id
 
+    @staticmethod
+    def _message_has_downloadable_media(message: Any) -> bool:
+        if getattr(message, "media", None) is not None:
+            return True
+        for attr in ("photo", "document", "voice", "audio", "video", "file"):
+            if getattr(message, attr, None) is not None:
+                return True
+        return False
+
+    async def _download_message_media_to_path(
+        self,
+        message: Any,
+        target_path: Path,
+    ) -> Optional[str]:
+        """Download Telethon media directly into a preselected cache path."""
+        download_media = getattr(message, "download_media", None)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not _path_is_within(target_path, target_path.parent):
+            raise ValueError(f"Unsafe Telegram User media target path: {target_path}")
+
+        tmp_path = target_path.with_name(
+            f".{target_path.name}.{uuid.uuid4().hex[:8]}.part"
+        )
+        result = None
+        downloaded_path: Optional[Path] = None
+        try:
+            if callable(download_media):
+                result = await download_media(file=str(tmp_path))
+            elif self._client is not None:
+                client_download = getattr(self._client, "download_media", None)
+                if callable(client_download):
+                    result = await client_download(message, file=str(tmp_path))
+
+            if isinstance(result, bytes):
+                tmp_path.write_bytes(result)
+                downloaded_path = tmp_path
+            elif isinstance(result, bytearray):
+                tmp_path.write_bytes(bytes(result))
+                downloaded_path = tmp_path
+            elif isinstance(result, str):
+                downloaded_path = Path(result).expanduser()
+            elif tmp_path.exists():
+                downloaded_path = tmp_path
+
+            if downloaded_path is None and tmp_path.exists():
+                downloaded_path = tmp_path
+            if downloaded_path is None or not downloaded_path.exists():
+                return None
+            if not downloaded_path.is_file() or downloaded_path.stat().st_size <= 0:
+                return None
+            if not _path_is_within(downloaded_path, target_path.parent):
+                raise ValueError(
+                    f"Telegram User media download escaped cache dir: {downloaded_path}"
+                )
+
+            atomic_replace(downloaded_path, target_path)
+            return str(target_path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+    async def _cache_inbound_media(
+        self,
+        message: Any,
+    ) -> tuple[List[str], List[str], Optional[MessageType]]:
+        """Download one Telethon message attachment into Hermes' media cache."""
+        if not self._message_has_downloadable_media(message):
+            return [], [], None
+
+        filename, ext, mime_type = _message_file_info(message)
+        is_photo = bool(getattr(message, "photo", None))
+        is_video = bool(getattr(message, "video", None))
+        is_voice = bool(getattr(message, "voice", None))
+        is_audio = bool(getattr(message, "audio", None))
+
+        if is_photo or mime_type.startswith("image/") or ext in _IMAGE_EXTENSIONS:
+            image_ext = (
+                ext if ext in _IMAGE_EXTENSIONS
+                else _IMAGE_MIME_TO_EXT.get(mime_type, ".jpg")
+            )
+            try:
+                target_path = _media_cache_target(MessageType.PHOTO, filename, image_ext)
+                cached_path = await self._download_message_media_to_path(message, target_path)
+            except Exception as exc:
+                logger.warning(
+                    "Telegram User: failed to download image-like media: %s",
+                    exc,
+                    exc_info=True,
+                )
+                return [], [], None
+            if cached_path and _looks_like_cached_image(Path(cached_path)):
+                return (
+                    [cached_path],
+                    [_IMAGE_EXT_TO_MIME.get(image_ext, mime_type or "image/jpeg")],
+                    MessageType.PHOTO,
+                )
+            if cached_path:
+                fallback_path = _media_cache_target(MessageType.DOCUMENT, filename, ext)
+                atomic_replace(cached_path, fallback_path)
+                media_type = mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                return [str(fallback_path)], [media_type], MessageType.DOCUMENT
+            logger.info("Telegram User: inbound image media download returned no data")
+            return [], [], None
+
+        if is_video or mime_type.startswith("video/") or ext in SUPPORTED_VIDEO_TYPES:
+            video_ext = ext if ext in SUPPORTED_VIDEO_TYPES else ".mp4"
+            try:
+                target_path = _media_cache_target(MessageType.VIDEO, filename, video_ext)
+                cached_path = await self._download_message_media_to_path(message, target_path)
+            except Exception as exc:
+                logger.warning(
+                    "Telegram User: failed to download video media: %s",
+                    exc,
+                    exc_info=True,
+                )
+                return [], [], None
+            if not cached_path:
+                logger.info("Telegram User: inbound video media download returned no data")
+                return [], [], None
+            return (
+                [cached_path],
+                [SUPPORTED_VIDEO_TYPES.get(video_ext, mime_type or "video/mp4")],
+                MessageType.VIDEO,
+            )
+
+        if is_voice or is_audio or mime_type.startswith("audio/") or ext in _AUDIO_EXTENSIONS:
+            audio_ext = (
+                ext if ext in _AUDIO_EXTENSIONS
+                else _AUDIO_MIME_TO_EXT.get(mime_type, ".ogg" if is_voice else ".mp3")
+            )
+            if audio_ext == ".opus":
+                audio_ext = ".ogg"
+            try:
+                target_path = _media_cache_target(
+                    MessageType.VOICE if is_voice else MessageType.AUDIO,
+                    filename,
+                    audio_ext,
+                )
+                cached_path = await self._download_message_media_to_path(message, target_path)
+            except Exception as exc:
+                logger.warning(
+                    "Telegram User: failed to download audio media: %s",
+                    exc,
+                    exc_info=True,
+                )
+                return [], [], None
+            if not cached_path:
+                logger.info("Telegram User: inbound audio media download returned no data")
+                return [], [], None
+            media_type = (
+                mime_type if mime_type.startswith("audio/")
+                else _AUDIO_EXT_TO_MIME.get(audio_ext, "audio/ogg")
+            )
+            return (
+                [cached_path],
+                [media_type],
+                MessageType.VOICE if is_voice else MessageType.AUDIO,
+            )
+
+        if not mime_type:
+            mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        try:
+            target_path = _media_cache_target(MessageType.DOCUMENT, filename, ext)
+            cached_path = await self._download_message_media_to_path(message, target_path)
+        except Exception as exc:
+            logger.warning(
+                "Telegram User: failed to download document media: %s",
+                exc,
+                exc_info=True,
+            )
+            return [], [], None
+        if not cached_path:
+            logger.info("Telegram User: inbound document media download returned no data")
+            return [], [], None
+        return [cached_path], [mime_type], MessageType.DOCUMENT
+
     async def _handle_new_message(self, event: Any) -> None:
         """Telethon NewMessage callback."""
         try:
@@ -1187,7 +1547,8 @@ class TelegramUserAdapter(BasePlatformAdapter):
             if message is None:
                 return
             text = str(getattr(event, "raw_text", "") or getattr(message, "message", "") or "")
-            if not text.strip():
+            has_media = self._message_has_downloadable_media(message)
+            if not text.strip() and not has_media:
                 return
             if getattr(event, "out", False) and not self.allow_outgoing:
                 return
@@ -1217,7 +1578,19 @@ class TelegramUserAdapter(BasePlatformAdapter):
                     return
                 text = cleaned or text
 
+            media_urls: List[str] = []
+            media_types: List[str] = []
+            media_message_type: Optional[MessageType] = None
+            if has_media:
+                media_urls, media_types, media_message_type = await self._cache_inbound_media(message)
+                if not media_urls and not text.strip():
+                    text = "[The user sent a Telegram attachment, but Hermes could not download it.]"
+
             msg_event = await self._build_message_event(event, chat, sender, text, chat_type)
+            if media_urls and media_message_type is not None:
+                msg_event.media_urls = media_urls
+                msg_event.media_types = media_types
+                msg_event.message_type = media_message_type
             await self.handle_message(msg_event)
         except asyncio.CancelledError:
             raise

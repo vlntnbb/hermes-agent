@@ -96,6 +96,7 @@ async def test_enrich_message_with_transcription_avoids_bogus_no_provider_messag
 
     assert "No STT provider is configured" not in result
     assert "trouble transcribing" in result
+    assert "Cached audio path: /tmp/voice.ogg" in result
     assert "caption" in result
 
 
