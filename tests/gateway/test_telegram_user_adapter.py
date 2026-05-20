@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -42,11 +43,42 @@ def _clear_telegram_user_env(monkeypatch):
 
 
 class _FakeMessage:
-    def __init__(self, *, message_id: int = 10, text: str = "hello"):
+    def __init__(
+        self,
+        *,
+        message_id: int = 10,
+        text: str = "hello",
+        media=None,
+        file=None,
+        photo=None,
+        voice=None,
+        audio=None,
+        video=None,
+        document=None,
+        media_bytes=None,
+    ):
         self.id = message_id
         self.message = text
         self.date = datetime(2026, 5, 12, 12, 0, 0)
         self.reply_to = None
+        self.media = media
+        self.file = file
+        self.photo = photo
+        self.voice = voice
+        self.audio = audio
+        self.video = video
+        self.document = document
+        self._media_bytes = media_bytes
+        self.download_targets = []
+
+    async def download_media(self, file=None):
+        self.download_targets.append(file)
+        if isinstance(self._media_bytes, BaseException):
+            raise self._media_bytes
+        if isinstance(file, (str, Path)):
+            Path(file).write_bytes(self._media_bytes or b"")
+            return str(file)
+        return self._media_bytes
 
 
 class _FakeEvent:
@@ -61,11 +93,29 @@ class _FakeEvent:
         is_channel: bool = False,
         out: bool = False,
         reply=None,
+        media=None,
+        file=None,
+        photo=None,
+        voice=None,
+        audio=None,
+        video=None,
+        document=None,
+        media_bytes=None,
     ):
         self.chat_id = chat_id
         self.sender_id = sender_id
         self.raw_text = text
-        self.message = _FakeMessage(text=text)
+        self.message = _FakeMessage(
+            text=text,
+            media=media,
+            file=file,
+            photo=photo,
+            voice=voice,
+            audio=audio,
+            video=video,
+            document=document,
+            media_bytes=media_bytes,
+        )
         self.is_private = is_private
         self.is_group = is_group
         self.is_channel = is_channel
@@ -204,6 +254,77 @@ async def test_build_message_event_maps_private_chat():
     assert msg_event.source.user_id == "456"
     assert msg_event.source.chat_type == "dm"
     assert msg_event.message_id == "10"
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_downloads_voice_only_media(monkeypatch, tmp_path):
+    adapter = _make_adapter({"allowed_chats": ["123"]})
+    adapter._account_user_id = "999"
+    monkeypatch.setattr(_mod, "get_audio_cache_dir", lambda: tmp_path)
+
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+
+    event = _FakeEvent(
+        chat_id=123,
+        sender_id=456,
+        text="",
+        voice=SimpleNamespace(),
+        file=SimpleNamespace(name="voice.ogg", ext=".ogg", mime_type="audio/ogg"),
+        media_bytes=b"voice-bytes",
+    )
+
+    await adapter._handle_new_message(event)
+
+    assert len(captured) == 1
+    assert captured[0].text == ""
+    assert captured[0].message_type == MessageType.VOICE
+    media_path = Path(captured[0].media_urls[0])
+    assert media_path.parent == tmp_path
+    assert media_path.name.startswith("audio_")
+    assert media_path.suffix == ".ogg"
+    assert media_path.read_bytes() == b"voice-bytes"
+    assert captured[0].media_types == ["audio/ogg"]
+    assert event.message.download_targets
+    assert event.message.download_targets[0] is not bytes
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_downloads_document_to_safe_cache_path(monkeypatch, tmp_path):
+    adapter = _make_adapter({"allowed_chats": ["123"]})
+    adapter._account_user_id = "999"
+    monkeypatch.setattr(_mod, "get_document_cache_dir", lambda: tmp_path)
+
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+
+    event = _FakeEvent(
+        chat_id=123,
+        sender_id=456,
+        text="",
+        document=SimpleNamespace(mime_type="application/pdf", attributes=[]),
+        file=SimpleNamespace(name="../../secret.pdf", ext=".pdf", mime_type="application/pdf"),
+        media_bytes=b"%PDF-test",
+    )
+
+    await adapter._handle_new_message(event)
+
+    assert len(captured) == 1
+    assert captured[0].message_type == MessageType.DOCUMENT
+    media_path = Path(captured[0].media_urls[0])
+    assert media_path.parent == tmp_path
+    assert media_path.name.startswith("doc_")
+    assert media_path.name.endswith("_secret.pdf")
+    assert media_path.read_bytes() == b"%PDF-test"
+    assert event.message.download_targets[0] is not bytes
 
 
 @pytest.mark.asyncio
