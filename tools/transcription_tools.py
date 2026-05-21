@@ -30,15 +30,17 @@ Usage::
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import tempfile
 import time
 import wave
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Mapping
 from urllib.parse import urljoin
 
 from utils import is_truthy_value
@@ -93,6 +95,10 @@ DEFAULT_GIGAAM_STT_MODEL = "v3_e2e_rnnt"
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+DEFAULT_GROQ_CHUNK_SECONDS = 600
+DEFAULT_GROQ_CHUNK_BITRATE = "64k"
+DEFAULT_GROQ_RATE_LIMIT_MAX_WAIT_SECONDS = 24 * 60 * 60
+DEFAULT_GROQ_RATE_LIMIT_FALLBACK_WAIT_SECONDS = 60
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -101,7 +107,7 @@ XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
-LOCAL_SIZE_UNLIMITED_PROVIDERS = {"local", "local_command", "gigaam"}
+PROVIDERS_WITH_INTERNAL_SIZE_HANDLING = {"local", "local_command", "gigaam", "groq"}
 
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
@@ -921,6 +927,352 @@ def _transcribe_gigaam(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _groq_upload_limit_bytes(groq_config: Dict[str, Any]) -> int:
+    raw_mb = _first_config_or_env(
+        groq_config,
+        "max_upload_mb",
+        ("STT_GROQ_MAX_UPLOAD_MB",),
+        24,
+    )
+    try:
+        mb = float(raw_mb)
+    except (TypeError, ValueError):
+        mb = 24.0
+    return int(max(1.0, mb) * 1024 * 1024)
+
+
+def _groq_chunk_sec(groq_config: Dict[str, Any]) -> int:
+    raw = _first_config_or_env(
+        groq_config,
+        "chunk_sec",
+        ("STT_GROQ_CHUNK_SEC",),
+        DEFAULT_GROQ_CHUNK_SECONDS,
+    )
+    try:
+        seconds = int(float(raw))
+    except (TypeError, ValueError):
+        seconds = DEFAULT_GROQ_CHUNK_SECONDS
+    return max(60, min(1800, seconds))
+
+
+def _groq_chunk_bitrate(groq_config: Dict[str, Any]) -> str:
+    raw = str(
+        _first_config_or_env(
+            groq_config,
+            "chunk_bitrate",
+            ("STT_GROQ_CHUNK_BITRATE",),
+            DEFAULT_GROQ_CHUNK_BITRATE,
+        )
+        or ""
+    ).strip().lower()
+    if raw and raw[:-1].isdigit() and raw[-1] in {"k", "m"}:
+        return raw
+    return DEFAULT_GROQ_CHUNK_BITRATE
+
+
+def _groq_language(groq_config: Dict[str, Any]) -> str:
+    value = _first_config_or_env(
+        groq_config,
+        "language",
+        ("STT_GROQ_LANGUAGE", LOCAL_STT_LANGUAGE_ENV),
+        "",
+    )
+    return str(value or "").strip()
+
+
+def _groq_rate_limit_max_wait_seconds(groq_config: Dict[str, Any]) -> float:
+    raw = _first_config_or_env(
+        groq_config,
+        "rate_limit_max_wait_sec",
+        ("STT_GROQ_RATE_LIMIT_MAX_WAIT_SEC",),
+        DEFAULT_GROQ_RATE_LIMIT_MAX_WAIT_SECONDS,
+    )
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(DEFAULT_GROQ_RATE_LIMIT_MAX_WAIT_SECONDS)
+
+
+def _groq_rate_limit_fallback_wait_seconds(groq_config: Dict[str, Any]) -> float:
+    raw = _first_config_or_env(
+        groq_config,
+        "rate_limit_fallback_wait_sec",
+        ("STT_GROQ_RATE_LIMIT_FALLBACK_WAIT_SEC",),
+        DEFAULT_GROQ_RATE_LIMIT_FALLBACK_WAIT_SECONDS,
+    )
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return float(DEFAULT_GROQ_RATE_LIMIT_FALLBACK_WAIT_SECONDS)
+
+
+def _headers_from_error(exc: BaseException) -> Mapping[str, Any]:
+    headers = getattr(exc, "headers", None)
+    response = getattr(exc, "response", None)
+    if headers is None and response is not None:
+        headers = getattr(response, "headers", None)
+    if headers is None:
+        return {}
+    return headers
+
+
+def _header_value(headers: Mapping[str, Any], name: str) -> Optional[str]:
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        value = getter(name)
+        if value is None:
+            value = getter(name.lower())
+        if value is None:
+            value = getter(name.upper())
+        if value is not None:
+            return str(value)
+    lowered = {str(k).lower(): v for k, v in dict(headers).items()}
+    value = lowered.get(name.lower())
+    return None if value is None else str(value)
+
+
+def _parse_wait_seconds(raw: Any) -> Optional[float]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+        return seconds if seconds > 0 else None
+    except ValueError:
+        pass
+
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt is not None:
+            return max(0.0, dt.timestamp() - time.time())
+    except (TypeError, ValueError, OSError):
+        pass
+
+    total = 0.0
+    matched = False
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|m|min|mins|h|hr|hrs)", text.lower()):
+        matched = True
+        amount = float(value)
+        if unit == "ms":
+            total += amount / 1000.0
+        elif unit in {"s", "sec", "secs"}:
+            total += amount
+        elif unit in {"m", "min", "mins"}:
+            total += amount * 60.0
+        elif unit in {"h", "hr", "hrs"}:
+            total += amount * 3600.0
+    if matched and total > 0:
+        return total
+    return None
+
+
+def _is_groq_rate_limit_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    name = exc.__class__.__name__.lower()
+    text = str(exc).lower()
+    return (
+        "ratelimit" in name
+        or "rate limit" in text
+        or "rate_limit" in text
+        or "too many requests" in text
+        or "quota exceeded" in text
+    )
+
+
+def _groq_rate_limit_wait_seconds(
+    exc: BaseException,
+    groq_config: Dict[str, Any],
+    attempt: int,
+) -> float:
+    headers = _headers_from_error(exc)
+
+    retry_after = _parse_wait_seconds(_header_value(headers, "retry-after"))
+    if retry_after is not None:
+        return max(1.0, retry_after + 1.0)
+
+    reset_values = []
+    for key, value in dict(headers).items():
+        lowered = str(key).lower()
+        if lowered.startswith("x-ratelimit-reset"):
+            parsed = _parse_wait_seconds(value)
+            if parsed is not None:
+                reset_values.append(parsed)
+    if reset_values:
+        return max(1.0, max(reset_values) + 1.0)
+
+    fallback = _groq_rate_limit_fallback_wait_seconds(groq_config)
+    return min(max(1.0, fallback * (2 ** max(0, attempt - 1))), 15 * 60.0)
+
+
+def _groq_rate_limit_sleep(seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            from tools.interrupt import is_interrupted
+            if is_interrupted():
+                raise RuntimeError("Groq STT rate-limit wait interrupted")
+        except ImportError:
+            pass
+        time.sleep(min(30.0, remaining))
+
+
+def _groq_create_transcription_with_rate_limit_wait(
+    *,
+    client: Any,
+    kwargs: Dict[str, Any],
+    groq_config: Dict[str, Any],
+    chunk_index: int,
+    chunk_total: int,
+    source_name: str,
+) -> Any:
+    started = time.monotonic()
+    attempt = 0
+    max_wait = _groq_rate_limit_max_wait_seconds(groq_config)
+    while True:
+        attempt += 1
+        try:
+            return client.audio.transcriptions.create(**kwargs)
+        except Exception as exc:
+            if not _is_groq_rate_limit_error(exc):
+                raise
+            wait_seconds = _groq_rate_limit_wait_seconds(exc, groq_config, attempt)
+            elapsed = time.monotonic() - started
+            if max_wait and elapsed + wait_seconds > max_wait:
+                raise RuntimeError(
+                    "Groq STT rate limit did not recover within "
+                    f"{max_wait:.0f}s while transcribing {source_name}"
+                ) from exc
+            logger.warning(
+                "Groq STT rate-limited on chunk %d/%d for %s; waiting %.0fs before retry",
+                chunk_index,
+                chunk_total,
+                source_name,
+                wait_seconds,
+            )
+            _groq_rate_limit_sleep(wait_seconds)
+
+
+def _prepare_groq_audio_chunks(
+    file_path: str,
+    work_dir: str,
+    groq_config: Dict[str, Any],
+) -> tuple[list[str], Optional[str]]:
+    """Return one or more uploadable files for Groq STT."""
+    source = Path(file_path)
+    limit = _groq_upload_limit_bytes(groq_config)
+    try:
+        if source.stat().st_size <= limit:
+            return [file_path], None
+    except OSError as exc:
+        return [], f"Failed to access file: {exc}"
+
+    ffmpeg_bin = str(
+        _first_config_or_env(groq_config, "ffmpeg_bin", ("STT_GROQ_FFMPEG_BIN", "FFMPEG_BIN"), "")
+        or _find_ffmpeg_binary()
+        or ""
+    )
+    if not ffmpeg_bin:
+        return [], (
+            "Groq STT requires ffmpeg to chunk files larger than "
+            f"{limit / (1024 * 1024):.0f}MB"
+        )
+
+    chunk_sec = _groq_chunk_sec(groq_config)
+    bitrate = _groq_chunk_bitrate(groq_config)
+    last_error = ""
+
+    while chunk_sec >= 60:
+        for old in Path(work_dir).glob("groq_chunk_*.mp3"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+        pattern = os.path.join(work_dir, "groq_chunk_%04d.mp3")
+        command = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            file_path,
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-b:a",
+            bitrate,
+            "-f",
+            "segment",
+            "-segment_time",
+            str(chunk_sec),
+            "-reset_timestamps",
+            "1",
+            pattern,
+        ]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            details = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            return [], f"Failed to chunk audio for Groq STT: {details}"
+
+        chunks = sorted(str(path) for path in Path(work_dir).glob("groq_chunk_*.mp3"))
+        if not chunks:
+            return [], "Failed to chunk audio for Groq STT: ffmpeg produced no chunks"
+
+        oversized = []
+        for chunk in chunks:
+            try:
+                if Path(chunk).stat().st_size > limit:
+                    oversized.append(chunk)
+            except OSError as exc:
+                return [], f"Failed to access Groq STT chunk: {exc}"
+        if not oversized:
+            logger.info(
+                "Prepared %d Groq STT chunk(s) for %s (segment=%ss, bitrate=%s)",
+                len(chunks),
+                source.name,
+                chunk_sec,
+                bitrate,
+            )
+            return chunks, None
+
+        last_error = (
+            f"{len(oversized)} Groq STT chunk(s) still exceeded "
+            f"{limit / (1024 * 1024):.0f}MB at {chunk_sec}s"
+        )
+        chunk_sec //= 2
+
+    return [], last_error or "Failed to create Groq STT chunks under upload limit"
+
+
+def _groq_transcription_create_kwargs(
+    model_name: str,
+    audio_file: Any,
+    groq_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    kwargs = {
+        "model": model_name,
+        "file": audio_file,
+        "response_format": "text",
+    }
+    language = _groq_language(groq_config)
+    if language:
+        kwargs["language"] = language
+    return kwargs
+
+
 def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using Groq Whisper API (free tier available)."""
     api_key = get_env_value("GROQ_API_KEY")
@@ -937,18 +1289,55 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
+        stt_config = _load_stt_config()
+        groq_config = stt_config.get("groq", {})
+        if not isinstance(groq_config, dict):
+            groq_config = {}
         client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
         try:
-            with open(file_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model=model_name,
-                    file=audio_file,
-                    response_format="text",
+            with tempfile.TemporaryDirectory(prefix="hermes-groq-stt-") as work_dir:
+                upload_paths, prep_error = _prepare_groq_audio_chunks(
+                    file_path,
+                    work_dir,
+                    groq_config,
                 )
+                if prep_error:
+                    return {"success": False, "transcript": "", "error": prep_error}
 
-            transcript_text = str(transcription).strip()
-            logger.info("Transcribed %s via Groq API (%s, %d chars)",
-                         Path(file_path).name, model_name, len(transcript_text))
+                transcript_parts: list[str] = []
+                for index, upload_path in enumerate(upload_paths):
+                    with open(upload_path, "rb") as audio_file:
+                        transcription = _groq_create_transcription_with_rate_limit_wait(
+                            client=client,
+                            kwargs=_groq_transcription_create_kwargs(
+                                model_name,
+                                audio_file,
+                                groq_config,
+                            ),
+                            groq_config=groq_config,
+                            chunk_index=index + 1,
+                            chunk_total=len(upload_paths),
+                            source_name=Path(file_path).name,
+                        )
+                    part_text = str(transcription).strip()
+                    if part_text:
+                        transcript_parts.append(part_text)
+                    logger.info(
+                        "Groq STT chunk %d/%d complete for %s (%d chars)",
+                        index + 1,
+                        len(upload_paths),
+                        Path(file_path).name,
+                        len(part_text),
+                    )
+
+            transcript_text = "\n\n".join(transcript_parts).strip()
+            logger.info(
+                "Transcribed %s via Groq API (%s, chunks=%d, %d chars)",
+                Path(file_path).name,
+                model_name,
+                len(upload_paths),
+                len(transcript_text),
+            )
 
             return {"success": True, "transcript": transcript_text, "provider": "groq"}
         finally:
@@ -1211,7 +1600,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         }
 
     provider = _get_provider(stt_config)
-    if provider not in LOCAL_SIZE_UNLIMITED_PROVIDERS:
+    if provider not in PROVIDERS_WITH_INTERNAL_SIZE_HANDLING:
         error = _validate_audio_file(file_path)
         if error:
             return error
@@ -1243,7 +1632,10 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         return _transcribe_gigaam(file_path, model_name)
 
     if provider == "groq":
-        model_name = model or DEFAULT_GROQ_STT_MODEL
+        groq_cfg = stt_config.get("groq", {})
+        if not isinstance(groq_cfg, dict):
+            groq_cfg = {}
+        model_name = model or groq_cfg.get("model") or DEFAULT_GROQ_STT_MODEL
         return _transcribe_groq(file_path, model_name)
 
     if provider == "openai":

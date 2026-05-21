@@ -261,6 +261,64 @@ class TestTranscribeGroq:
         assert result["provider"] == "groq"
         mock_client.close.assert_called_once()
 
+    def test_chunked_transcription_uses_groq_for_each_chunk(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = ["first part", "second part"]
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"groq": {"language": "ru"}}), \
+             patch("tools.transcription_tools._prepare_groq_audio_chunks", return_value=([sample_wav, sample_wav], None)), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_groq
+            result = _transcribe_groq(sample_wav, "whisper-large-v3-turbo")
+
+        assert result["success"] is True
+        assert result["transcript"] == "first part\n\nsecond part"
+        assert result["provider"] == "groq"
+        assert mock_client.audio.transcriptions.create.call_count == 2
+        first_call = mock_client.audio.transcriptions.create.call_args_list[0]
+        assert first_call.kwargs["model"] == "whisper-large-v3-turbo"
+        assert first_call.kwargs["response_format"] == "text"
+        assert first_call.kwargs["language"] == "ru"
+        mock_client.close.assert_called_once()
+
+    def test_rate_limit_waits_and_retries_same_groq_chunk(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+
+        class _Response:
+            headers = {"retry-after": "2"}
+
+        class _RateLimitError(Exception):
+            status_code = 429
+            response = _Response()
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = [
+            _RateLimitError("rate limit exceeded"),
+            "recovered",
+        ]
+
+        sleeps = []
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch(
+                 "tools.transcription_tools._load_stt_config",
+                 return_value={"groq": {"rate_limit_max_wait_sec": 30}},
+             ), \
+             patch("tools.transcription_tools._prepare_groq_audio_chunks", return_value=([sample_wav], None)), \
+             patch("tools.transcription_tools._groq_rate_limit_sleep", side_effect=lambda seconds: sleeps.append(seconds)), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_groq
+            result = _transcribe_groq(sample_wav, "whisper-large-v3-turbo")
+
+        assert result["success"] is True
+        assert result["transcript"] == "recovered"
+        assert mock_client.audio.transcriptions.create.call_count == 2
+        assert sleeps == [3.0]
+        mock_client.close.assert_called_once()
+
     def test_whitespace_stripped(self, monkeypatch, sample_wav):
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
 
@@ -942,6 +1000,53 @@ class TestTranscribeAudioDispatch:
         assert result["success"] is True
         assert result["provider"] == "local_command"
         mock_local_command.assert_called_once()
+
+    def test_large_audio_dispatches_to_groq_without_global_size_gate(self, tmp_path):
+        audio_file = tmp_path / "big.ogg"
+        audio_file.write_bytes(b"x")
+
+        from tools.transcription_tools import MAX_FILE_SIZE, transcribe_audio
+
+        real_stat = audio_file.stat()
+        fake_stat = os.stat_result((
+            real_stat.st_mode,
+            real_stat.st_ino,
+            real_stat.st_dev,
+            real_stat.st_nlink,
+            real_stat.st_uid,
+            real_stat.st_gid,
+            MAX_FILE_SIZE + 1,
+            real_stat.st_atime,
+            real_stat.st_mtime,
+            real_stat.st_ctime,
+        ))
+
+        with patch.object(type(audio_file), "stat", return_value=fake_stat), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"provider": "groq"}), \
+             patch("tools.transcription_tools._get_provider", return_value="groq"), \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": True, "transcript": "large groq ok", "provider": "groq"},
+             ) as mock_groq:
+            result = transcribe_audio(str(audio_file))
+
+        assert result["success"] is True
+        assert result["provider"] == "groq"
+        mock_groq.assert_called_once()
+
+    def test_groq_dispatch_uses_configured_model(self, sample_ogg):
+        config = {"provider": "groq", "groq": {"model": "whisper-large-v3"}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="groq"), \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": True, "transcript": "ok", "provider": "groq"},
+             ) as mock_groq:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert mock_groq.call_args.args[1] == "whisper-large-v3"
 
     def test_large_audio_cloud_provider_still_uses_size_gate(self, tmp_path):
         audio_file = tmp_path / "big.ogg"
