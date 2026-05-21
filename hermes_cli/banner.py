@@ -122,6 +122,7 @@ def get_available_skills() -> Dict[str, List[str]]:
 
 # Cache update check results for 6 hours to avoid repeated git fetches
 _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
+_UPDATE_CHECK_CACHE_SCHEMA = 2
 
 # Sentinel returned when we know an update exists but can't count commits
 # (e.g. nix-built hermes — no local git history to count against).
@@ -151,20 +152,60 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+def _git_ref_exists(repo_dir: Path, ref: str) -> bool:
     try:
-        subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _fetch_remote(repo_dir: Path, remote: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "fetch", remote, "--quiet"],
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
     except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        return False
+    return result.returncode == 0
+
+
+def _select_canonical_main_ref(repo_dir: Path, *, fetch: bool = False) -> Optional[str]:
+    """Prefer the official upstream main ref, falling back to origin/main.
+
+    Fork installs commonly use ``origin`` for the user's fork and ``upstream``
+    for NousResearch/hermes-agent. Update checks should report whether the
+    install is behind the official repo, not whether the fork remote is stale.
+    """
+    if fetch:
+        _fetch_remote(repo_dir, "upstream")
+    if _git_ref_exists(repo_dir, "upstream/main"):
+        return "upstream/main"
+
+    if fetch:
+        _fetch_remote(repo_dir, "origin")
+    if _git_ref_exists(repo_dir, "origin/main"):
+        return "origin/main"
+
+    return None
+
+
+def _check_via_local_git(repo_dir: Path) -> Optional[int]:
+    """Count commits behind the canonical main ref in a local checkout."""
+    compare_ref = _select_canonical_main_ref(repo_dir, fetch=True)
+    if not compare_ref:
+        return None
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{compare_ref}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -240,6 +281,7 @@ def check_for_updates() -> Optional[int]:
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
+                and cached.get("schema") == _UPDATE_CHECK_CACHE_SCHEMA
             ):
                 return cached.get("behind")
     except Exception:
@@ -260,7 +302,12 @@ def check_for_updates() -> Optional[int]:
             behind = _check_via_local_git(repo_dir)
 
     try:
-        cache_file.write_text(json.dumps({"ts": now, "behind": behind, "rev": embedded_rev}))
+        cache_file.write_text(json.dumps({
+            "schema": _UPDATE_CHECK_CACHE_SCHEMA,
+            "ts": now,
+            "behind": behind,
+            "rev": embedded_rev,
+        }))
     except Exception:
         pass
 
@@ -305,7 +352,11 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     if repo_dir is None:
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    compare_ref = _select_canonical_main_ref(repo_dir, fetch=False)
+    if not compare_ref:
+        return None
+
+    upstream = _git_short_hash(repo_dir, compare_ref)
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         return None
@@ -313,7 +364,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{compare_ref}..HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -324,7 +375,12 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     except Exception:
         ahead = 0
 
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+    return {
+        "upstream": upstream,
+        "local": local,
+        "ahead": max(ahead, 0),
+        "ref": compare_ref,
+    }
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
@@ -383,12 +439,13 @@ def format_banner_version_label() -> str:
     upstream = state["upstream"]
     local = state["local"]
     ahead = int(state.get("ahead") or 0)
+    ref_label = "upstream" if str(state.get("ref", "upstream/main")).startswith("upstream/") else "origin"
 
     if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
+        return f"{base} · {ref_label} {upstream}"
 
     carried_word = "commit" if ahead == 1 else "commits"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
+    return f"{base} · {ref_label} {upstream} · local {local} (+{ahead} carried {carried_word})"
 
 
 # =========================================================================

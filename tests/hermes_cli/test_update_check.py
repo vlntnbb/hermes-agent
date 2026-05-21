@@ -26,7 +26,7 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
+    cache_file.write_text(json.dumps({"schema": 2, "ts": time.time(), "behind": 3}))
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with patch("hermes_cli.banner.subprocess.run") as mock_run:
@@ -55,7 +55,30 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
         result = check_for_updates()
 
     assert result == 5
-    assert mock_run.call_count == 2  # git fetch + git rev-list
+    assert mock_run.call_count >= 2  # git fetch/ref lookup + git rev-list
+
+
+def test_check_for_updates_prefers_upstream_for_forks(tmp_path, monkeypatch):
+    """Fork installs compare against official upstream/main when available."""
+    from hermes_cli.banner import check_for_updates
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(json.dumps({"schema": 2, "ts": 0, "behind": 99}))
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ["git", "fetch", "upstream", "--quiet"]:
+            return MagicMock(returncode=0, stdout="")
+        if cmd == ["git", "rev-parse", "--verify", "--quiet", "upstream/main"]:
+            return MagicMock(returncode=0, stdout="")
+        if cmd == ["git", "rev-list", "--count", "HEAD..upstream/main"]:
+            return MagicMock(returncode=0, stdout="0\n")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
+        result = check_for_updates()
+
+    assert result == 0
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
