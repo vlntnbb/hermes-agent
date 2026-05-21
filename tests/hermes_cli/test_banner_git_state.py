@@ -46,6 +46,8 @@ def test_get_git_banner_state_reads_origin_and_head(tmp_path):
     (repo_dir / ".git").mkdir(parents=True)
 
     results = {
+        ("git", "rev-parse", "--verify", "--quiet", "upstream/main"): MagicMock(returncode=1, stdout=""),
+        ("git", "rev-parse", "--verify", "--quiet", "origin/main"): MagicMock(returncode=0, stdout=""),
         ("git", "rev-parse", "--short=8", "origin/main"): MagicMock(returncode=0, stdout="b2f477a3\n"),
         ("git", "rev-parse", "--short=8", "HEAD"): MagicMock(returncode=0, stdout="af8aad31\n"),
         ("git", "rev-list", "--count", "origin/main..HEAD"): MagicMock(returncode=0, stdout="3\n"),
@@ -60,7 +62,12 @@ def test_get_git_banner_state_reads_origin_and_head(tmp_path):
     with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
         state = banner.get_git_banner_state(repo_dir)
 
-    assert state == {"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3}
+    assert state == {
+        "upstream": "b2f477a3",
+        "local": "af8aad31",
+        "ahead": 3,
+        "ref": "origin/main",
+    }
 
 
 def test_get_git_banner_state_falls_back_to_build_sha_when_no_repo():
