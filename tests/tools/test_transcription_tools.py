@@ -910,6 +910,69 @@ class TestTranscribeAudioDispatch:
         assert result["success"] is True
         mock_openai.assert_called_once()
 
+    def test_large_audio_dispatches_to_local_command_without_size_gate(self, tmp_path):
+        audio_file = tmp_path / "big.ogg"
+        audio_file.write_bytes(b"x")
+
+        from tools.transcription_tools import MAX_FILE_SIZE, transcribe_audio
+
+        real_stat = audio_file.stat()
+        fake_stat = os.stat_result((
+            real_stat.st_mode,
+            real_stat.st_ino,
+            real_stat.st_dev,
+            real_stat.st_nlink,
+            real_stat.st_uid,
+            real_stat.st_gid,
+            MAX_FILE_SIZE + 1,
+            real_stat.st_atime,
+            real_stat.st_mtime,
+            real_stat.st_ctime,
+        ))
+
+        with patch.object(type(audio_file), "stat", return_value=fake_stat), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"provider": "local_command"}), \
+             patch("tools.transcription_tools._get_provider", return_value="local_command"), \
+             patch(
+                 "tools.transcription_tools._transcribe_local_command",
+                 return_value={"success": True, "transcript": "large ok", "provider": "local_command"},
+             ) as mock_local_command:
+            result = transcribe_audio(str(audio_file))
+
+        assert result["success"] is True
+        assert result["provider"] == "local_command"
+        mock_local_command.assert_called_once()
+
+    def test_large_audio_cloud_provider_still_uses_size_gate(self, tmp_path):
+        audio_file = tmp_path / "big.ogg"
+        audio_file.write_bytes(b"x")
+
+        from tools.transcription_tools import MAX_FILE_SIZE, transcribe_audio
+
+        real_stat = audio_file.stat()
+        fake_stat = os.stat_result((
+            real_stat.st_mode,
+            real_stat.st_ino,
+            real_stat.st_dev,
+            real_stat.st_nlink,
+            real_stat.st_uid,
+            real_stat.st_gid,
+            MAX_FILE_SIZE + 1,
+            real_stat.st_atime,
+            real_stat.st_mtime,
+            real_stat.st_ctime,
+        ))
+
+        with patch.object(type(audio_file), "stat", return_value=fake_stat), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"provider": "openai"}), \
+             patch("tools.transcription_tools._get_provider", return_value="openai"), \
+             patch("tools.transcription_tools._transcribe_openai") as mock_openai:
+            result = transcribe_audio(str(audio_file))
+
+        assert result["success"] is False
+        assert "File too large" in result["error"]
+        mock_openai.assert_not_called()
+
     def test_dispatches_to_gigaam(self, sample_ogg):
         config = {"provider": "gigaam", "gigaam": {"model": "v2_rnnt"}}
         with patch("tools.transcription_tools._load_stt_config", return_value=config), \

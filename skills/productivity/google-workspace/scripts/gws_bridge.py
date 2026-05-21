@@ -15,11 +15,22 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from _hermes_home import get_hermes_home
+from _google_accounts import resolve_google_account_paths, write_account_metadata
+
+
+_ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths()
+TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
+
+
+def configure_account(account: str | None = None):
+    global _ACTIVE_ACCOUNT_PATHS, TOKEN_PATH
+    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account)
+    TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
+    return _ACTIVE_ACCOUNT_PATHS
 
 
 def get_token_path() -> Path:
-    return get_hermes_home() / "google_token.json"
+    return TOKEN_PATH
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -68,9 +79,12 @@ def refresh_token(token_data: dict) -> dict:
         tz=timezone.utc,
     ).isoformat()
 
-    get_token_path().write_text(
+    token_path = get_token_path()
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
         json.dumps(_normalize_authorized_user_payload(token_data), indent=2)
     )
+    write_account_metadata(_ACTIVE_ACCOUNT_PATHS)
     return token_data
 
 
@@ -95,15 +109,29 @@ def get_valid_token() -> str:
 
 def main():
     """Refresh token if needed, then exec gws with remaining args."""
-    if len(sys.argv) < 2:
-        print("Usage: gws_bridge.py <gws args...>", file=sys.stderr)
+    argv = sys.argv[1:]
+    account = None
+    if argv and argv[0] == "--account":
+        if len(argv) < 2:
+            print("ERROR: --account requires an email/account value.", file=sys.stderr)
+            sys.exit(2)
+        account = argv[1]
+        argv = argv[2:]
+    elif argv and argv[0].startswith("--account="):
+        account = argv[0].split("=", 1)[1]
+        argv = argv[1:]
+
+    configure_account(account)
+
+    if not argv:
+        print("Usage: gws_bridge.py [--account ACCOUNT] <gws args...>", file=sys.stderr)
         sys.exit(1)
 
     access_token = get_valid_token()
     env = os.environ.copy()
     env["GOOGLE_WORKSPACE_CLI_TOKEN"] = access_token
 
-    result = subprocess.run(["gws"] + sys.argv[1:], env=env)
+    result = subprocess.run(["gws"] + argv, env=env)
     sys.exit(result.returncode)
 
 

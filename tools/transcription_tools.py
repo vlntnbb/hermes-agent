@@ -101,6 +101,7 @@ XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+LOCAL_SIZE_UNLIMITED_PROVIDERS = {"local", "local_command", "gigaam"}
 
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
@@ -324,7 +325,11 @@ def _get_provider(stt_config: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
+def _validate_audio_file(
+    file_path: str,
+    *,
+    enforce_size_limit: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Validate the audio file.  Returns an error dict or None if OK."""
     audio_path = Path(file_path)
 
@@ -340,7 +345,7 @@ def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
         }
     try:
         file_size = audio_path.stat().st_size
-        if file_size > MAX_FILE_SIZE:
+        if enforce_size_limit and file_size > MAX_FILE_SIZE:
             return {
                 "success": False,
                 "transcript": "",
@@ -1190,8 +1195,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
           - "error" (str, optional): Error message if success is False
           - "provider" (str, optional): Which provider was used
     """
-    # Validate input
-    error = _validate_audio_file(file_path)
+    # Validate basic path/format first. Cloud size limits are provider-specific,
+    # so defer the 25 MB check until after provider resolution.
+    error = _validate_audio_file(file_path, enforce_size_limit=False)
     if error:
         return error
 
@@ -1205,6 +1211,10 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         }
 
     provider = _get_provider(stt_config)
+    if provider not in LOCAL_SIZE_UNLIMITED_PROVIDERS:
+        error = _validate_audio_file(file_path)
+        if error:
+            return error
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})
