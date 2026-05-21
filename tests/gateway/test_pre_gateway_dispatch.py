@@ -82,6 +82,30 @@ async def test_hook_skip_short_circuits_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_async_hook_skip_short_circuits_dispatch(monkeypatch):
+    """Async pre-dispatch hooks must be awaited before dispatch decisions."""
+    _clear_auth_env(monkeypatch)
+
+    async def _skip_later():
+        return {"action": "skip", "reason": "async-plugin-handled"}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [_skip_later()]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+
+    result = await runner._handle_message(_make_event("hi"))
+
+    assert result is None
+    adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_hook_rewrite_replaces_event_text(monkeypatch):
     """A plugin returning {'action': 'rewrite', 'text': ...} mutates event.text."""
     _clear_auth_env(monkeypatch)

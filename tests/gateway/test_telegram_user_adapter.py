@@ -328,6 +328,46 @@ async def test_handle_new_message_downloads_document_to_safe_cache_path(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_recover_client_connection_reconnects_existing_client(monkeypatch):
+    adapter = _make_adapter({"allowed_chats": ["123"]})
+    status_writes = []
+
+    class FakeClient:
+        def __init__(self):
+            self.disconnects = 0
+            self.connects = 0
+
+        async def disconnect(self):
+            self.disconnects += 1
+
+        async def connect(self):
+            self.connects += 1
+
+        async def is_user_authorized(self):
+            return True
+
+    async def no_sleep(_seconds):
+        return None
+
+    fake_client = FakeClient()
+    adapter._client = fake_client
+    adapter._running = True
+    monkeypatch.setattr(_mod.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        adapter,
+        "_write_runtime_status_safe",
+        lambda context, **kwargs: status_writes.append((context, kwargs)),
+    )
+
+    await adapter._recover_client_connection("health_check_failed", RuntimeError("stale receiver"))
+
+    assert fake_client.disconnects == 1
+    assert fake_client.connects == 1
+    assert adapter.is_connected is True
+    assert any(context == "health_failed" for context, _ in status_writes)
+
+
+@pytest.mark.asyncio
 async def test_build_message_event_maps_group_auth_to_chat_id():
     adapter = _make_adapter({"allowed_chats": ["-100123"]})
     event = _FakeEvent(

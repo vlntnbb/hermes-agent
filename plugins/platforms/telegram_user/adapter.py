@@ -671,9 +671,21 @@ class TelegramUserAdapter(BasePlatformAdapter):
             or extra.get("flood_wait_threshold_seconds"),
             60.0,
         )
+        self.health_check_seconds = _coerce_float(
+            os.getenv("TELEGRAM_USER_HEALTH_CHECK_SECONDS")
+            or extra.get("health_check_seconds"),
+            60.0,
+        )
+        self.health_timeout_seconds = _coerce_float(
+            os.getenv("TELEGRAM_USER_HEALTH_TIMEOUT_SECONDS")
+            or extra.get("health_timeout_seconds"),
+            15.0,
+        )
 
         self._client: Any = None
         self._event_builder: Any = None
+        self._health_task: Optional[asyncio.Task] = None
+        self._disconnecting = False
         self._me: Any = None
         self._account_user_id: str = ""
         self._account_username: str = ""
@@ -757,6 +769,8 @@ class TelegramUserAdapter(BasePlatformAdapter):
                 self._event_builder = events.NewMessage(incoming=True)
             self._client.add_event_handler(self._handle_new_message, self._event_builder)
             self._mark_connected()
+            self._disconnecting = False
+            self._start_health_monitor()
             logger.info(
                 "Telegram User: connected as user_id=%s username=%s",
                 self._account_user_id or "<unknown>",
@@ -781,6 +795,8 @@ class TelegramUserAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect the Telethon client and release the session lock."""
+        self._disconnecting = True
+        await self._stop_health_monitor()
         client = self._client
         if client is not None:
             try:
@@ -796,6 +812,105 @@ class TelegramUserAdapter(BasePlatformAdapter):
         self._client = None
         self._event_builder = None
         self._mark_disconnected()
+
+    def _start_health_monitor(self) -> None:
+        if self.health_check_seconds <= 0:
+            return
+        task = self._health_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._health_task = loop.create_task(self._health_monitor())
+
+    async def _stop_health_monitor(self) -> None:
+        task = self._health_task
+        self._health_task = None
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Telegram User: health monitor shutdown failed", exc_info=True)
+
+    async def _health_monitor(self) -> None:
+        """Keep the Telethon receiver honest and reconnect after silent stalls."""
+        while not self._disconnecting:
+            await asyncio.sleep(self.health_check_seconds)
+            if self._disconnecting or self._client is None:
+                return
+            try:
+                await self._probe_client_health()
+                if not self.is_connected:
+                    self._mark_connected()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._recover_client_connection("health_check_failed", exc)
+
+    async def _probe_client_health(self) -> None:
+        client = self._client
+        if client is None:
+            raise RuntimeError("client is not initialized")
+        if not client.is_connected():
+            raise RuntimeError("client is disconnected")
+        from telethon.functions import PingRequest  # type: ignore
+
+        ping_id = int(time.time() * 1000) & 0x7FFFFFFFFFFFFFFF
+        await asyncio.wait_for(
+            client(PingRequest(ping_id=ping_id)),
+            timeout=max(self.health_timeout_seconds, 1.0),
+        )
+
+    async def _recover_client_connection(self, reason: str, exc: BaseException) -> None:
+        client = self._client
+        if client is None or self._disconnecting:
+            return
+        logger.warning(
+            "Telegram User: %s; reconnecting Telethon client: %s",
+            reason,
+            exc,
+        )
+        self._write_runtime_status_safe(
+            "health_failed",
+            platform_state="disconnected",
+            error_code=reason,
+            error_message=str(exc),
+        )
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=10)
+        except Exception:
+            logger.debug("Telegram User: disconnect during reconnect failed", exc_info=True)
+        if self._disconnecting:
+            return
+        await asyncio.sleep(2)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=max(self.health_timeout_seconds, 5.0))
+            if not await client.is_user_authorized():
+                message = "Telethon session is not authorized. Run telegram_user setup/login again."
+                self._set_fatal_error("session_unauthorized", message, retryable=False)
+                logger.error("Telegram User: %s", message)
+                return
+            self._mark_connected()
+            logger.info("Telegram User: reconnected after %s", reason)
+        except Exception as reconnect_exc:
+            self._write_runtime_status_safe(
+                "health_reconnect_failed",
+                platform_state="disconnected",
+                error_code="reconnect_failed",
+                error_message=str(reconnect_exc),
+            )
+            logger.warning(
+                "Telegram User: reconnect failed after %s: %s",
+                reason,
+                reconnect_exc,
+                exc_info=True,
+            )
 
     async def _rate_limit_send(self) -> None:
         if self.send_interval_seconds <= 0:
