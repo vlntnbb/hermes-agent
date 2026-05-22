@@ -136,6 +136,33 @@ async def test_audio_attachment_context_note_format():
     assert "voice message" not in result.lower()
 
 
+@pytest.mark.asyncio
+async def test_audio_attachment_with_user_request_does_not_prompt_for_clarification():
+    """Audio plus an explicit request should point the agent at the tool."""
+    runner = _make_runner(stt_enabled=True)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+    event = _audio_event("/tmp/audio_12345__1Basilico Restaurant 2.mp3")
+    event.text = "Транскрибируй идеально"
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=AssertionError("must not be called by gateway preprocessing"),
+    ):
+        with patch(
+            "tools.credential_files.to_agent_visible_cache_path",
+            side_effect=lambda p: p,
+        ):
+            result = await runner._prepare_inbound_message_text(
+                event=event,
+                source=source,
+                history=[],
+            )
+
+    assert "Use this path with a transcription or media tool" in result
+    assert "Ask the user what they'd like you to do" not in result
+    assert "Транскрибируй идеально" in result
+
+
 # ---------------------------------------------------------------------------
 # 3. STT disabled still results in no transcription for audio file attachments
 # ---------------------------------------------------------------------------

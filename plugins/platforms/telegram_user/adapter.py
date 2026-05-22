@@ -320,7 +320,16 @@ def _media_cache_target(
     if message_type == MessageType.PHOTO:
         cache_dir = get_image_cache_dir()
         target = cache_dir / f"img_{token}{safe_ext or '.jpg'}"
-    elif message_type in {MessageType.AUDIO, MessageType.VOICE}:
+    elif message_type == MessageType.AUDIO:
+        cache_dir = get_audio_cache_dir()
+        safe_name = _sanitize_cache_filename(filename, "telegram_user_audio")
+        if safe_ext:
+            safe_stem = Path(safe_name).stem or "telegram_user_audio"
+            safe_name = f"{safe_stem}{safe_ext}"
+        elif not Path(safe_name).suffix:
+            safe_name = f"{safe_name}.ogg"
+        target = cache_dir / f"audio_{token}_{safe_name}"
+    elif message_type == MessageType.VOICE:
         cache_dir = get_audio_cache_dir()
         target = cache_dir / f"audio_{token}{safe_ext or '.ogg'}"
     elif message_type == MessageType.VIDEO:
@@ -681,10 +690,17 @@ class TelegramUserAdapter(BasePlatformAdapter):
             or extra.get("health_timeout_seconds"),
             15.0,
         )
+        self.media_batch_delay_seconds = _coerce_float(
+            os.getenv("TELEGRAM_USER_MEDIA_BATCH_DELAY_SECONDS")
+            or extra.get("media_batch_delay_seconds"),
+            2.0,
+        )
 
         self._client: Any = None
         self._event_builder: Any = None
         self._health_task: Optional[asyncio.Task] = None
+        self._audio_media_batches: Dict[str, Dict[str, Any]] = {}
+        self._audio_media_flush_tasks: Dict[str, asyncio.Task] = {}
         self._disconnecting = False
         self._me: Any = None
         self._account_user_id: str = ""
@@ -796,6 +812,7 @@ class TelegramUserAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect the Telethon client and release the session lock."""
         self._disconnecting = True
+        await self._cancel_audio_media_batches()
         await self._stop_health_monitor()
         client = self._client
         if client is not None:
@@ -1655,6 +1672,193 @@ class TelegramUserAdapter(BasePlatformAdapter):
             return [], [], None
         return [cached_path], [mime_type], MessageType.DOCUMENT
 
+    def _is_audio_file_attachment(self, message: Any) -> bool:
+        """Return True for Telegram audio files, but not voice messages."""
+        if not self._message_has_downloadable_media(message):
+            return False
+        if getattr(message, "voice", None) is not None:
+            return False
+        filename, ext, mime_type = _message_file_info(message)
+        return (
+            bool(getattr(message, "audio", None))
+            or mime_type.startswith("audio/")
+            or ext in _AUDIO_EXTENSIONS
+        )
+
+    def _audio_media_batch_key(
+        self,
+        event: Any,
+        chat: Any,
+        sender: Any,
+        chat_type: str,
+    ) -> str:
+        message = getattr(event, "message", event)
+        chat_id = str(getattr(event, "chat_id", "") or getattr(chat, "id", ""))
+        sender_id = str(
+            getattr(event, "sender_id", "")
+            or getattr(sender, "id", "")
+            or chat_id
+        )
+        thread_id = self._message_thread_id(message, chat_type) or ""
+        return f"{chat_type}:{chat_id}:{sender_id}:{thread_id}"
+
+    @staticmethod
+    def _append_audio_batch_text(batch: Dict[str, Any], text: str) -> None:
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return
+        texts = batch.setdefault("texts", [])
+        if clean_text not in texts:
+            texts.append(clean_text)
+        event = batch.get("event")
+        if event is not None:
+            event.text = "\n\n".join(texts)
+
+    async def _queue_audio_media_batch_item(
+        self,
+        key: str,
+        event: Any,
+        chat: Any,
+        sender: Any,
+        text: str,
+        chat_type: str,
+    ) -> None:
+        batch = self._audio_media_batches.get(key)
+        if batch is None:
+            msg_event = await self._build_message_event(event, chat, sender, "", chat_type)
+            batch = {
+                "event": msg_event,
+                "texts": [],
+                "download_tasks": [],
+                "created_at": time.monotonic(),
+                "flush_after": 0.0,
+            }
+            self._audio_media_batches[key] = batch
+        self._append_audio_batch_text(batch, text)
+
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(self._cache_inbound_media(getattr(event, "message", event)))
+        batch.setdefault("download_tasks", []).append(task)
+        self._schedule_audio_media_batch_flush(key)
+
+    async def _attach_text_to_audio_media_batch(self, key: str, text: str) -> bool:
+        batch = self._audio_media_batches.get(key)
+        if batch is None:
+            return False
+        self._append_audio_batch_text(batch, text)
+        self._schedule_audio_media_batch_flush(key)
+        return True
+
+    def _schedule_audio_media_batch_flush(self, key: str) -> None:
+        batch = self._audio_media_batches.get(key)
+        if batch is None:
+            return
+        delay = max(self.media_batch_delay_seconds, 0.0)
+        batch["flush_after"] = time.monotonic() + delay
+        task = self._audio_media_flush_tasks.get(key)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._audio_media_flush_tasks[key] = loop.create_task(
+            self._flush_audio_media_batch_when_ready(key)
+        )
+
+    async def _flush_audio_media_batch_when_ready(self, key: str) -> None:
+        try:
+            while True:
+                batch = self._audio_media_batches.get(key)
+                if batch is None:
+                    return
+                flush_after = float(batch.get("flush_after") or 0.0)
+                wait_seconds = flush_after - time.monotonic()
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+                    continue
+
+                tasks = list(batch.get("download_tasks", []) or [])
+                if tasks:
+                    await asyncio.gather(
+                        *(asyncio.shield(task) for task in tasks),
+                        return_exceptions=True,
+                    )
+
+                current = self._audio_media_batches.get(key)
+                if current is not batch:
+                    return
+                latest_tasks = list(batch.get("download_tasks", []) or [])
+                if (
+                    len(latest_tasks) == len(tasks)
+                    and time.monotonic() >= float(batch.get("flush_after") or 0.0)
+                ):
+                    break
+
+            batch = self._audio_media_batches.pop(key, None)
+            if batch is None:
+                return
+
+            media_urls: List[str] = []
+            media_types: List[str] = []
+            for task in batch.get("download_tasks", []) or []:
+                try:
+                    result = task.result()
+                except Exception as exc:
+                    logger.warning(
+                        "Telegram User: failed to download batched audio: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+                if not result:
+                    continue
+                urls, types, message_type = result
+                if message_type != MessageType.AUDIO:
+                    continue
+                media_urls.extend(urls)
+                media_types.extend(types)
+
+            msg_event = batch.get("event")
+            if msg_event is None:
+                return
+            if media_urls:
+                msg_event.media_urls = media_urls
+                msg_event.media_types = media_types
+                msg_event.message_type = MessageType.AUDIO
+            elif not str(getattr(msg_event, "text", "") or "").strip():
+                msg_event.text = (
+                    "[The user sent Telegram audio attachments, "
+                    "but Hermes could not download them.]"
+                )
+            await self.handle_message(msg_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Telegram User: audio batch flush failed: %s", exc, exc_info=True)
+        finally:
+            task = self._audio_media_flush_tasks.get(key)
+            if task is asyncio.current_task():
+                self._audio_media_flush_tasks.pop(key, None)
+
+    async def _cancel_audio_media_batches(self) -> None:
+        flush_tasks = list(self._audio_media_flush_tasks.values())
+        download_tasks = []
+        for batch in self._audio_media_batches.values():
+            download_tasks.extend(batch.get("download_tasks", []) or [])
+        self._audio_media_flush_tasks.clear()
+        self._audio_media_batches.clear()
+        for task in flush_tasks + download_tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [
+            task
+            for task in flush_tasks + download_tasks
+            if task is not None and task is not asyncio.current_task()
+        ]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def _handle_new_message(self, event: Any) -> None:
         """Telethon NewMessage callback."""
         try:
@@ -1692,6 +1896,21 @@ class TelegramUserAdapter(BasePlatformAdapter):
                 if not triggered and not await self._is_reply_to_self(event):
                     return
                 text = cleaned or text
+
+            audio_batch_key = self._audio_media_batch_key(event, chat, sender, chat_type)
+            if has_media and self._is_audio_file_attachment(message):
+                await self._queue_audio_media_batch_item(
+                    audio_batch_key,
+                    event,
+                    chat,
+                    sender,
+                    text,
+                    chat_type,
+                )
+                return
+            if text.strip() and not has_media and not text.lstrip().startswith("/"):
+                if await self._attach_text_to_audio_media_batch(audio_batch_key, text):
+                    return
 
             media_urls: List[str] = []
             media_types: List[str] = []
