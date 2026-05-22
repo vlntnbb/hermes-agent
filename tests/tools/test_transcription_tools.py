@@ -9,6 +9,7 @@ import os
 import struct
 import subprocess
 import wave
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -86,6 +87,28 @@ class TestGetProviderGroq:
              patch("tools.transcription_tools._HAS_OPENAI", False):
             from tools.transcription_tools import _get_provider
             assert _get_provider({"provider": "groq"}) == "none"
+
+
+class TestGetProviderIdealRus:
+    """Ideal Russian STT provider selection tests."""
+
+    def test_ideal_rus_when_groq_key_set(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        with patch("tools.transcription_tools._HAS_OPENAI", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "ideal_rus"}) == "ideal_rus"
+
+    def test_ideal_rus_alias(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        with patch("tools.transcription_tools._HAS_OPENAI", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "ideal"}) == "ideal_rus"
+
+    def test_ideal_rus_requires_groq_key(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        with patch("tools.transcription_tools._HAS_OPENAI", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "ideal_rus"}) == "none"
 
 
 class TestGetProviderFallbackPriority:
@@ -750,6 +773,99 @@ class TestTranscribeGigaAM:
 
 
 # ============================================================================
+# _transcribe_ideal_rus
+# ============================================================================
+
+class TestTranscribeIdealRus:
+    def test_runs_gigaam_groq_then_llm_merge(self, sample_ogg):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="идеальный текст"))]
+        )
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={"ideal_rus": {}}), \
+             patch(
+                 "tools.transcription_tools._transcribe_gigaam",
+                 return_value={"success": True, "transcript": "гигаам текст", "provider": "gigaam"},
+             ) as mock_gigaam, \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": True, "transcript": "грок текст", "provider": "groq"},
+             ) as mock_groq, \
+             patch("agent.auxiliary_client.call_llm", return_value=response) as mock_llm:
+            from tools.transcription_tools import _transcribe_ideal_rus
+            result = _transcribe_ideal_rus(sample_ogg, "whisper-large-v3-turbo")
+
+        assert result["success"] is True
+        assert result["provider"] == "ideal_rus"
+        assert result["transcript"] == "идеальный текст"
+        assert result["merge"]["used"] is True
+        assert mock_gigaam.call_args[0][1] == "v3_e2e_rnnt"
+        assert mock_groq.call_args[0][1] == "whisper-large-v3-turbo"
+        assert mock_llm.call_args.kwargs["task"] == "transcription_merge"
+        assert mock_llm.call_args.kwargs["temperature"] == 0
+
+    def test_uses_configured_models(self, sample_ogg):
+        config = {
+            "ideal_rus": {
+                "gigaam_model": "v2_rnnt",
+                "groq_model": "whisper-large-v3",
+                "merge": False,
+            },
+        }
+
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch(
+                 "tools.transcription_tools._transcribe_gigaam",
+                 return_value={"success": True, "transcript": "г", "provider": "gigaam"},
+             ) as mock_gigaam, \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": True, "transcript": "w", "provider": "groq"},
+             ) as mock_groq:
+            from tools.transcription_tools import _transcribe_ideal_rus
+            result = _transcribe_ideal_rus(sample_ogg)
+
+        assert result["success"] is True
+        assert result["merge"]["used"] is False
+        assert mock_gigaam.call_args[0][1] == "v2_rnnt"
+        assert mock_groq.call_args[0][1] == "whisper-large-v3"
+
+    def test_single_success_returns_available_draft(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={"ideal_rus": {}}), \
+             patch(
+                 "tools.transcription_tools._transcribe_gigaam",
+                 return_value={"success": False, "transcript": "", "error": "boom"},
+             ), \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": True, "transcript": "только groq", "provider": "groq"},
+             ):
+            from tools.transcription_tools import _transcribe_ideal_rus
+            result = _transcribe_ideal_rus(sample_ogg)
+
+        assert result["success"] is True
+        assert result["transcript"] == "только groq"
+        assert result["merge"]["reason"] == "gigaam_empty"
+
+    def test_both_fail_returns_error(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={"ideal_rus": {}}), \
+             patch(
+                 "tools.transcription_tools._transcribe_gigaam",
+                 return_value={"success": False, "transcript": "", "error": "gigaam failed"},
+             ), \
+             patch(
+                 "tools.transcription_tools._transcribe_groq",
+                 return_value={"success": False, "transcript": "", "error": "groq failed"},
+             ):
+            from tools.transcription_tools import _transcribe_ideal_rus
+            result = _transcribe_ideal_rus(sample_ogg)
+
+        assert result["success"] is False
+        assert "GigaAM: gigaam failed" in result["error"]
+        assert "Groq: groq failed" in result["error"]
+
+
+# ============================================================================
 # Model auto-correction
 # ============================================================================
 
@@ -1090,6 +1206,24 @@ class TestTranscribeAudioDispatch:
         assert result["success"] is True
         assert result["provider"] == "gigaam"
         assert mock_gigaam.call_args[0][1] == "v2_rnnt"
+
+    def test_dispatches_to_ideal_rus(self, sample_ogg):
+        config = {
+            "provider": "ideal_rus",
+            "ideal_rus": {"groq_model": "whisper-large-v3"},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="ideal_rus"), \
+             patch(
+                 "tools.transcription_tools._transcribe_ideal_rus",
+                 return_value={"success": True, "transcript": "hi", "provider": "ideal_rus"},
+             ) as mock_ideal:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["provider"] == "ideal_rus"
+        assert mock_ideal.call_args[0][1] == "whisper-large-v3"
 
     def test_no_provider_returns_error(self, sample_ogg):
         with patch("tools.transcription_tools._load_stt_config", return_value={}), \

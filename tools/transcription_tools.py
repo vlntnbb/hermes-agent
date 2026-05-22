@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with seven providers:
+Provides speech-to-text transcription with eight providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -13,6 +13,8 @@ Provides speech-to-text transcription with seven providers:
     Inverse Text Normalization, diarization, 21 languages.
   - **gigaam** — local GigaAM model for Russian speech, no API key needed.
     Requires the ``gigaam`` package and ``ffmpeg`` for non-WAV inputs.
+  - **ideal_rus** — high-accuracy Russian pipeline: GigaAM + Groq Whisper,
+    then an auxiliary LLM merge into one clean transcript.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -99,6 +101,7 @@ DEFAULT_GROQ_CHUNK_SECONDS = 600
 DEFAULT_GROQ_CHUNK_BITRATE = "64k"
 DEFAULT_GROQ_RATE_LIMIT_MAX_WAIT_SECONDS = 24 * 60 * 60
 DEFAULT_GROQ_RATE_LIMIT_FALLBACK_WAIT_SECONDS = 60
+DEFAULT_IDEAL_RUS_MERGE_TASK = "transcription_merge"
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -107,7 +110,7 @@ XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
-PROVIDERS_WITH_INTERNAL_SIZE_HANDLING = {"local", "local_command", "gigaam", "groq"}
+PROVIDERS_WITH_INTERNAL_SIZE_HANDLING = {"local", "local_command", "gigaam", "groq", "ideal_rus"}
 
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
@@ -119,6 +122,7 @@ GIGAAM_FALLBACK_MODELS = {
     "v3_e2e_ctc": "v2_ctc",
     "v3_ctc": "v2_ctc",
 }
+IDEAL_RUS_PROVIDER_ALIASES = {"ideal", "ideal-rus", "ideal_rus", "russian_ideal", "gigaam_groq"}
 
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
@@ -229,10 +233,20 @@ def _get_provider(stt_config: dict) -> str:
 
     explicit = "provider" in stt_config
     provider = stt_config.get("provider", DEFAULT_PROVIDER)
+    provider_normalized = str(provider or "").strip().lower()
 
     # --- Explicit provider: respect the user's choice ----------------------
 
     if explicit:
+        if provider_normalized in IDEAL_RUS_PROVIDER_ALIASES:
+            if _HAS_OPENAI and get_env_value("GROQ_API_KEY"):
+                return "ideal_rus"
+            logger.warning(
+                "STT provider 'ideal_rus' configured but GROQ_API_KEY is not set "
+                "or the openai package is unavailable"
+            )
+            return "none"
+
         if provider == "local":
             if _HAS_FASTER_WHISPER:
                 return "local"
@@ -1357,6 +1371,177 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
         logger.error("Groq transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
 
+
+# ---------------------------------------------------------------------------
+# Provider: ideal_rus (GigaAM + Groq + LLM merge)
+# ---------------------------------------------------------------------------
+
+
+def _ideal_rus_merge_messages(gigaam_text: str, groq_text: str) -> list[dict[str, str]]:
+    system = (
+        "You are an expert Russian transcription editor. Create one clean, "
+        "faithful transcript from two ASR drafts of the same audio. Preserve "
+        "the speaker's meaning, order, names, numbers, and terminology. "
+        "Prefer GigaAM for Russian word forms and endings. Prefer Groq/Whisper "
+        "for English words, mixed Russian/English phrases, names, product "
+        "terms, acronyms, and punctuation when it is clearly better. Remove "
+        "ASR artifacts, repeated fragments, hallucinated filler, and obvious "
+        "recognition errors. Return only the final transcript, not a summary."
+    )
+    user = (
+        "GigaAM draft:\n"
+        f"{gigaam_text.strip()}\n\n"
+        "Groq Whisper draft:\n"
+        f"{groq_text.strip()}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    return coerced if coerced > 0 else None
+
+
+def _merge_ideal_rus_transcripts(
+    gigaam_text: str,
+    groq_text: str,
+    ideal_config: Dict[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    gigaam_text = (gigaam_text or "").strip()
+    groq_text = (groq_text or "").strip()
+    if not gigaam_text:
+        return groq_text, {"used": False, "reason": "gigaam_empty"}
+    if not groq_text:
+        return gigaam_text, {"used": False, "reason": "groq_empty"}
+    if not is_truthy_value(ideal_config.get("merge", True), default=True):
+        return (
+            f"GigaAM:\n{gigaam_text}\n\nGroq Whisper:\n{groq_text}",
+            {"used": False, "reason": "merge_disabled"},
+        )
+
+    task = str(ideal_config.get("merge_task") or DEFAULT_IDEAL_RUS_MERGE_TASK).strip()
+    provider = str(ideal_config.get("merge_provider") or "").strip() or None
+    model = str(ideal_config.get("merge_model") or "").strip() or None
+    base_url = str(ideal_config.get("merge_base_url") or "").strip() or None
+    api_key = str(ideal_config.get("merge_api_key") or "").strip() or None
+    timeout_raw = ideal_config.get("merge_timeout")
+    timeout = None
+    if timeout_raw not in (None, ""):
+        try:
+            timeout = float(timeout_raw)
+        except (TypeError, ValueError):
+            timeout = None
+
+    try:
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+        response = call_llm(
+            task=task,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            messages=_ideal_rus_merge_messages(gigaam_text, groq_text),
+            temperature=0,
+            max_tokens=_coerce_optional_int(ideal_config.get("merge_max_tokens")),
+            timeout=timeout,
+            usage_source="stt.ideal_rus",
+        )
+        merged = extract_content_or_reasoning(response).strip()
+        if merged:
+            return merged, {
+                "used": True,
+                "task": task,
+                "provider": provider or "auto",
+                "model": model or "",
+            }
+        return (
+            f"GigaAM:\n{gigaam_text}\n\nGroq Whisper:\n{groq_text}",
+            {"used": False, "error": "LLM merge returned empty text", "task": task},
+        )
+    except Exception as exc:
+        logger.warning("Ideal Russian STT LLM merge failed: %s", exc, exc_info=True)
+        return (
+            f"GigaAM:\n{gigaam_text}\n\nGroq Whisper:\n{groq_text}",
+            {"used": False, "error": str(exc), "task": task},
+        )
+
+
+def _transcribe_ideal_rus(file_path: str, model_name: Optional[str] = None) -> Dict[str, Any]:
+    """Transcribe Russian audio with GigaAM and Groq, then merge both drafts."""
+    stt_config = _load_stt_config()
+    ideal_config = stt_config.get("ideal_rus", {})
+    if not isinstance(ideal_config, dict):
+        ideal_config = {}
+    gigaam_config = stt_config.get("gigaam", {})
+    if not isinstance(gigaam_config, dict):
+        gigaam_config = {}
+    groq_config = stt_config.get("groq", {})
+    if not isinstance(groq_config, dict):
+        groq_config = {}
+
+    gigaam_model = _normalize_gigaam_model_name(
+        ideal_config.get("gigaam_model")
+        or gigaam_config.get("model")
+        or get_env_value("GIGAAM_MODEL")
+        or DEFAULT_GIGAAM_STT_MODEL
+    )
+    groq_model = (
+        model_name
+        or ideal_config.get("groq_model")
+        or groq_config.get("model")
+        or DEFAULT_GROQ_STT_MODEL
+    )
+
+    started = time.monotonic()
+    gigaam_result = _transcribe_gigaam(file_path, gigaam_model)
+    groq_result = _transcribe_groq(file_path, groq_model)
+
+    gigaam_text = str(gigaam_result.get("transcript") or "").strip() if gigaam_result.get("success") else ""
+    groq_text = str(groq_result.get("transcript") or "").strip() if groq_result.get("success") else ""
+
+    if not gigaam_text and not groq_text:
+        error_parts = []
+        if gigaam_result.get("error"):
+            error_parts.append(f"GigaAM: {gigaam_result['error']}")
+        if groq_result.get("error"):
+            error_parts.append(f"Groq: {groq_result['error']}")
+        return {
+            "success": False,
+            "transcript": "",
+            "provider": "ideal_rus",
+            "error": "; ".join(error_parts) or "Both GigaAM and Groq returned empty transcripts",
+            "gigaam": gigaam_result,
+            "groq": groq_result,
+        }
+
+    transcript, merge_info = _merge_ideal_rus_transcripts(gigaam_text, groq_text, ideal_config)
+    logger.info(
+        "Transcribed %s via ideal_rus (gigaam=%s, groq=%s, merge=%s, %.1fs wall, %d chars)",
+        Path(file_path).name,
+        bool(gigaam_text),
+        bool(groq_text),
+        merge_info.get("used"),
+        time.monotonic() - started,
+        len(transcript),
+    )
+    return {
+        "success": True,
+        "transcript": transcript,
+        "provider": "ideal_rus",
+        "gigaam": gigaam_result,
+        "groq": groq_result,
+        "merge": merge_info,
+    }
+
 # ---------------------------------------------------------------------------
 # Provider: openai (Whisper API)
 # ---------------------------------------------------------------------------
@@ -1631,6 +1816,16 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         )
         return _transcribe_gigaam(file_path, model_name)
 
+    if provider == "ideal_rus":
+        ideal_cfg = stt_config.get("ideal_rus", {})
+        if not isinstance(ideal_cfg, dict):
+            ideal_cfg = {}
+        groq_cfg = stt_config.get("groq", {})
+        if not isinstance(groq_cfg, dict):
+            groq_cfg = {}
+        model_name = model or ideal_cfg.get("groq_model") or groq_cfg.get("model") or DEFAULT_GROQ_STT_MODEL
+        return _transcribe_ideal_rus(file_path, model_name)
+
     if provider == "groq":
         groq_cfg = stt_config.get("groq", {})
         if not isinstance(groq_cfg, dict):
@@ -1660,10 +1855,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         "error": (
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
+            "set stt.provider: ideal_rus for GigaAM + Groq + LLM Russian transcription, "
             "set stt.provider: gigaam for local Russian GigaAM, set GROQ_API_KEY for free "
-            "Groq Whisper, set MISTRAL_API_KEY for Mistral Voxtral Transcribe, configure "
-            "xAI OAuth or set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
-            "or OPENAI_API_KEY for the OpenAI Whisper API."
+            "Groq Whisper, set MISTRAL_API_KEY for Mistral Voxtral Transcribe, configure xAI OAuth "
+            "or set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY "
+            "for the OpenAI Whisper API."
         ),
     }
 
