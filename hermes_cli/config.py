@@ -1212,6 +1212,14 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        "transcription_merge": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 600,
+            "extra_body": {},
+        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
@@ -1473,10 +1481,20 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "gigaam" (local Russian) | "groq" | "openai" | "mistral" | "xai" | "elevenlabs"
+        "provider": "local",  # "local" | "ideal_rus" | "gigaam" | "groq" | "openai" | "mistral" | "xai" | "elevenlabs"
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+        },
+        "ideal_rus": {
+            "gigaam_model": "v3_e2e_rnnt",
+            "groq_model": "whisper-large-v3-turbo",
+            "merge": True,
+            "merge_task": "transcription_merge",
+            "merge_provider": "",    # empty = auxiliary auto routing
+            "merge_model": "",
+            "merge_timeout": 600,
+            "merge_max_tokens": 0,   # 0 = provider default
         },
         "gigaam": {
             "model": "v3_e2e_rnnt",  # v3_e2e_rnnt | v3_e2e_ctc | v2_rnnt | v2_ctc
@@ -1484,6 +1502,15 @@ DEFAULT_CONFIG = {
             "chunk_sec": 20,         # chunk size for long audio when long-form is unavailable
             "fallback_chunking": False,  # if long-form with HF_TOKEN fails, fall back to chunks
             "hf_token": "",          # optional Hugging Face token for GigaAM long-form VAD
+        },
+        "groq": {
+            "model": "whisper-large-v3-turbo",
+            "language": "ru",
+            "chunk_sec": 600,
+            "chunk_bitrate": "64k",
+            "max_upload_mb": 24,
+            "rate_limit_max_wait_sec": 86400,
+            "rate_limit_fallback_wait_sec": 60,
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
