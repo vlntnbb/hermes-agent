@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -291,6 +292,67 @@ async def test_handle_new_message_downloads_voice_only_media(monkeypatch, tmp_pa
     assert captured[0].media_types == ["audio/ogg"]
     assert event.message.download_targets
     assert event.message.download_targets[0] is not bytes
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_batches_audio_files_with_followup_text(monkeypatch, tmp_path):
+    adapter = _make_adapter({"allowed_chats": ["123"], "media_batch_delay_seconds": 0.01})
+    adapter._account_user_id = "999"
+    monkeypatch.setattr(_mod, "get_audio_cache_dir", lambda: tmp_path)
+
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+
+    first = _FakeEvent(
+        chat_id=123,
+        sender_id=456,
+        text="",
+        audio=SimpleNamespace(),
+        file=SimpleNamespace(
+            name="_1Basilico Restaurant 2.qta",
+            ext=".qta",
+            mime_type="audio/mpeg",
+        ),
+        media_bytes=b"audio-one",
+    )
+    second = _FakeEvent(
+        chat_id=123,
+        sender_id=456,
+        text="",
+        audio=SimpleNamespace(),
+        file=SimpleNamespace(
+            name="_2Rose Valley Park.qta",
+            ext=".qta",
+            mime_type="audio/mpeg",
+        ),
+        media_bytes=b"audio-two",
+    )
+    command = _FakeEvent(
+        chat_id=123,
+        sender_id=456,
+        text="Транскрибируй идеально и добавь в документ",
+    )
+
+    await adapter._handle_new_message(first)
+    await adapter._handle_new_message(second)
+    assert captured == []
+
+    await adapter._handle_new_message(command)
+    await asyncio.gather(*list(adapter._audio_media_flush_tasks.values()))
+
+    assert len(captured) == 1
+    assert captured[0].text == "Транскрибируй идеально и добавь в документ"
+    assert captured[0].message_type == MessageType.AUDIO
+    assert captured[0].media_types == ["audio/mpeg", "audio/mpeg"]
+    media_names = [Path(path).name for path in captured[0].media_urls]
+    assert "_1Basilico Restaurant 2.mp3" in media_names[0]
+    assert "_2Rose Valley Park.mp3" in media_names[1]
+    assert Path(captured[0].media_urls[0]).read_bytes() == b"audio-one"
+    assert Path(captured[0].media_urls[1]).read_bytes() == b"audio-two"
 
 
 @pytest.mark.asyncio

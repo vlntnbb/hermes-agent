@@ -7681,16 +7681,26 @@ class GatewayRunner:
 
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
+            _has_user_request = bool(message_text.strip())
             for _apath in audio_file_paths:
                 _basename = os.path.basename(_apath)
                 _parts = _basename.split("_", 2)
                 _display = _parts[2] if len(_parts) >= 3 else _basename
                 _display = re.sub(r'[^\w.\- ]', '_', _display)
                 _agent_path = _to_agent_path(_apath)
+                _audio_instruction = (
+                    "Use this path with a transcription or media tool if it helps "
+                    "satisfy the user's request; ask only if the request is ambiguous."
+                    if _has_user_request
+                    else (
+                        "Ask the user what they'd like you to do with it, or pass "
+                        "the path to a transcription or media tool."
+                    )
+                )
                 _note = (
                     f"[The user sent an audio file attachment: '{_display}'. "
                     f"It is saved at: {_agent_path}. "
-                    f"Ask the user what they'd like you to do with it, or pass the path to a transcription or media tool.]"
+                    f"{_audio_instruction}]"
                 )
                 message_text = f"{_note}\n\n{message_text}"
 
