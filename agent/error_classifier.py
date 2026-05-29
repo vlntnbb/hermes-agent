@@ -718,10 +718,20 @@ def _classify_by_status(
         )
 
     if status_code in {500, 502}:
-        return result_fn(FailoverReason.server_error, retryable=True)
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
 
     if status_code in {503, 529}:
-        return result_fn(FailoverReason.overloaded, retryable=True)
+        return result_fn(
+            FailoverReason.overloaded,
+            retryable=True,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
 
     # Other 4xx — non-retryable
     if 400 <= status_code < 500:
@@ -733,7 +743,12 @@ def _classify_by_status(
 
     # Other 5xx — retryable
     if 500 <= status_code < 600:
-        return result_fn(FailoverReason.server_error, retryable=True)
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
 
     return None
 
@@ -897,6 +912,22 @@ def _classify_by_error_code(
             FailoverReason.context_overflow,
             retryable=True,
             should_compress=True,
+        )
+
+    if code_lower in {"server_error", "internal_error", "internal_server_error"}:
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
+
+    if code_lower in {"overloaded", "service_unavailable", "temporarily_unavailable"}:
+        return result_fn(
+            FailoverReason.overloaded,
+            retryable=True,
+            should_rotate_credential=True,
+            should_fallback=True,
         )
 
     return None
