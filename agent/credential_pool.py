@@ -109,6 +109,7 @@ SUPPORTED_POOL_STRATEGIES = {
 # Provider-supplied reset_at timestamps override these defaults.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
+EXHAUSTED_TTL_TRANSIENT_SECONDS = 5 * 60     # 5 minutes
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
@@ -251,6 +252,8 @@ def _exhausted_ttl(error_code: Optional[int]) -> int:
         return EXHAUSTED_TTL_401_SECONDS
     if error_code == 429:
         return EXHAUSTED_TTL_429_SECONDS
+    if error_code in {408, 409, 425, 500, 502, 503, 504, 529}:
+        return EXHAUSTED_TTL_TRANSIENT_SECONDS
     return EXHAUSTED_TTL_DEFAULT_SECONDS
 
 

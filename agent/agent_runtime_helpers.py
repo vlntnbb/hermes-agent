@@ -641,6 +641,32 @@ def recover_with_credential_pool(
             return True, False
         return False, True
 
+    if effective_reason in {FailoverReason.server_error, FailoverReason.overloaded}:
+        try:
+            has_rotation_room = len(pool.entries()) > 1 and pool.has_available()
+        except Exception:
+            has_rotation_room = True
+        if not has_rotation_room:
+            return False, has_retried_429
+
+        rotate_status = status_code
+        if rotate_status is None:
+            rotate_status = 503 if effective_reason == FailoverReason.overloaded else 500
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+        )
+        if next_entry is not None:
+            _ra().logger.info(
+                "Credential %s (%s) — rotated to pool entry %s",
+                rotate_status,
+                effective_reason.value,
+                getattr(next_entry, "id", "?"),
+            )
+            agent._swap_credential(next_entry)
+            return True, False
+        return False, has_retried_429
+
     if effective_reason == FailoverReason.auth:
         # Subscription/entitlement 403s look like auth failures on the wire
         # but refresh cannot fix them — the OAuth token is already valid,

@@ -20,7 +20,8 @@ from agent.codex_responses_adapter import _normalize_codex_response
 
 import run_agent
 from run_agent import AIAgent
-from agent.error_classifier import FailoverReason
+from agent.credential_pool import EXHAUSTED_TTL_TRANSIENT_SECONDS, _exhausted_ttl
+from agent.error_classifier import FailoverReason, classify_api_error
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -4309,6 +4310,25 @@ class TestNousCredentialRefresh:
 
 
 class TestCredentialPoolRecovery:
+    def test_error_code_server_error_classifies_for_rotation(self):
+        error = SimpleNamespace(
+            body={
+                "code": "server_error",
+                "message": "The model provider failed after retries.",
+            },
+        )
+
+        classified = classify_api_error(
+            error,
+            provider="openai-codex",
+            model="gpt-5.5",
+        )
+
+        assert classified.reason is FailoverReason.server_error
+        assert classified.retryable is True
+        assert classified.should_rotate_credential is True
+        assert classified.should_fallback is True
+
     def test_recover_with_pool_rotates_on_402(self, agent):
         current = SimpleNamespace(label="primary")
         next_entry = SimpleNamespace(label="secondary")
@@ -4356,6 +4376,69 @@ class TestCredentialPoolRecovery:
         assert recovered is True
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
+
+    def test_recover_with_pool_rotates_on_server_error_when_pool_has_alternates(self, agent):
+        next_entry = SimpleNamespace(label="secondary", id="def")
+        captured = {}
+
+        class _Pool:
+            def entries(self):
+                return [
+                    SimpleNamespace(label="primary", id="abc"),
+                    SimpleNamespace(label="secondary", id="def"),
+                ]
+
+            def has_available(self):
+                return True
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                captured["status_code"] = status_code
+                captured["error_context"] = error_context
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=None,
+            has_retried_429=False,
+            classified_reason=FailoverReason.server_error,
+            error_context={"reason": "server_error"},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert captured["status_code"] == 500
+        assert captured["error_context"] == {"reason": "server_error"}
+        agent._swap_credential.assert_called_once_with(next_entry)
+
+    def test_recover_with_pool_does_not_rotate_server_error_on_single_credential(self, agent):
+        class _Pool:
+            def entries(self):
+                return [SimpleNamespace(label="primary", id="abc")]
+
+            def has_available(self):
+                return True
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                raise AssertionError("single-entry pool should not rotate")
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=500,
+            has_retried_429=False,
+            classified_reason=FailoverReason.server_error,
+        )
+
+        assert recovered is False
+        assert retry_same is False
+        agent._swap_credential.assert_not_called()
+
+    def test_transient_server_error_pool_cooldown_is_short(self):
+        assert _exhausted_ttl(500) == EXHAUSTED_TTL_TRANSIENT_SECONDS
+        assert _exhausted_ttl(503) == EXHAUSTED_TTL_TRANSIENT_SECONDS
 
     def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
         next_entry = SimpleNamespace(label="secondary")
