@@ -883,6 +883,51 @@ class TestCodexStreamCallbacks:
         # 1 initial + 1 retry = 2 calls
         assert call_count["n"] == 2
 
+    def test_codex_stream_backfills_null_output_from_done_item(self):
+        from run_agent import AIAgent
+
+        done_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="ok")],
+        )
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="ok"),
+            SimpleNamespace(type="response.output_item.done", item=done_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(output=None, status="completed"),
+            ),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeCreateStream()
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        response = agent._run_codex_stream(
+            {"model": "test/model", "instructions": "hi", "input": []},
+            client=mock_client,
+        )
+
+        assert response.output == [done_item]
+        mock_client.responses.create.assert_called_once()
+
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 
@@ -931,6 +976,49 @@ class TestCodexStreamCallbacks:
         )
 
         assert touch_calls.count("receiving stream response") == len(events)
+
+    def test_codex_create_stream_fallback_backfills_null_output_from_done_item(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+
+        done_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="ok")],
+        )
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="ok"),
+            SimpleNamespace(type="response.output_item.done", item=done_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(output=None, status="completed"),
+            ),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeCreateStream()
+
+        response = agent._run_codex_create_stream_fallback(
+            {"model": "test/model", "instructions": "hi", "input": []},
+            client=mock_client,
+        )
+
+        assert response.output == [done_item]
 
 
 class TestAnthropicStreamCallbacks:
