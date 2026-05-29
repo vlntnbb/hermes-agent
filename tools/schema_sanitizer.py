@@ -267,7 +267,19 @@ def _sanitize_node(node: Any, path: str) -> Any:
                 _sanitize_node(item, f"{path}.{key}[{i}]")
                 for i, item in enumerate(value)
             ]
-        elif key in {"required", "enum", "examples"}:
+        elif key == "required":
+            # ``required`` must be an array of property-name strings.  Some
+            # built-in/plugin schemas historically used ``required: None`` as
+            # an "all optional" marker, but schema processors expect an
+            # iterable here. Omit the key instead.
+            if isinstance(value, list):
+                out[key] = copy.deepcopy(value)
+            else:
+                logger.debug(
+                    "schema_sanitizer[%s]: dropping non-list required=%r",
+                    path, value,
+                )
+        elif key in {"enum", "examples"}:
             # Schema "sibling" keywords whose values are NOT schemas:
             #  - ``required``: list of property-name strings
             #  - ``enum``: list of literal values (any JSON type)
