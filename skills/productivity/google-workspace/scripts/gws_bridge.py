@@ -22,9 +22,9 @@ _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths()
 TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
 
 
-def configure_account(account: str | None = None):
+def configure_account(account: str | None = None, profile: str | None = None):
     global _ACTIVE_ACCOUNT_PATHS, TOKEN_PATH
-    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account)
+    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account, profile=profile)
     TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
     return _ACTIVE_ACCOUNT_PATHS
 
@@ -67,6 +67,16 @@ def refresh_token(token_data: dict) -> dict:
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         print(f"ERROR: Token refresh failed (HTTP {e.code}): {body}", file=sys.stderr)
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {}
+        if payload.get("error_subtype") == "invalid_rapt":
+            print(
+                "ERROR: Google requires interactive re-authentication for this token "
+                "(invalid_rapt); do not use this human OAuth token for unattended cron.",
+                file=sys.stderr,
+            )
         print("Re-run setup.py to re-authenticate.", file=sys.stderr)
         sys.exit(1)
     except (urllib.error.URLError, TimeoutError) as e:
@@ -111,6 +121,7 @@ def main():
     """Refresh token if needed, then exec gws with remaining args."""
     argv = sys.argv[1:]
     account = None
+    profile = None
     if argv and argv[0] == "--account":
         if len(argv) < 2:
             print("ERROR: --account requires an email/account value.", file=sys.stderr)
@@ -120,11 +131,20 @@ def main():
     elif argv and argv[0].startswith("--account="):
         account = argv[0].split("=", 1)[1]
         argv = argv[1:]
+    if argv and argv[0] == "--profile":
+        if len(argv) < 2:
+            print("ERROR: --profile requires a credential profile value.", file=sys.stderr)
+            sys.exit(2)
+        profile = argv[1]
+        argv = argv[2:]
+    elif argv and argv[0].startswith("--profile="):
+        profile = argv[0].split("=", 1)[1]
+        argv = argv[1:]
 
-    configure_account(account)
+    configure_account(account, profile)
 
     if not argv:
-        print("Usage: gws_bridge.py [--account ACCOUNT] <gws args...>", file=sys.stderr)
+        print("Usage: gws_bridge.py [--account ACCOUNT] [--profile PROFILE] <gws args...>", file=sys.stderr)
         sys.exit(1)
 
     access_token = get_valid_token()

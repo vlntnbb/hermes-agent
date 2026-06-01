@@ -34,11 +34,16 @@ Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OA
 
 Hermes supports multiple Google OAuth identities in one profile. Use
 `--account user@example.com` during setup and API calls to bind credentials to a
-named account. Named account files live under:
+named account. Use `--profile <purpose>` when the same Google account needs
+separate tokens for separate jobs, such as `funnel-sync` vs `sysadmin`.
+For cron profile setup, use the smallest matching scope bundle:
+`--scope-set funnel-sync`.
+Named account files live under:
 
 ```text
 ~/.hermes/google/accounts/user@example.com/google_client_secret.json
 ~/.hermes/google/accounts/user@example.com/google_token.json
+~/.hermes/google/accounts/user@example.com/profiles/funnel-sync/google_token.json
 ```
 
 The legacy files in `~/.hermes/google_client_secret.json` and
@@ -56,7 +61,8 @@ python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/script
 ```
 
 For one-off commands, either pass `--account user@example.com` or set
-`HERMES_GOOGLE_ACCOUNT=user@example.com`.
+`HERMES_GOOGLE_ACCOUNT=user@example.com`. For profile-scoped credentials, pass
+`--profile funnel-sync` or set `HERMES_GOOGLE_PROFILE=funnel-sync`.
 
 ## First-Time Setup
 
@@ -74,6 +80,7 @@ GSETUP="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspac
 ```bash
 $GSETUP --check
 $GSETUP --check --account user@example.com
+$GSETUP --check --account user@example.com --profile funnel-sync --scope-set funnel-sync
 ```
 
 If it prints `AUTHENTICATED`, skip to Usage — setup is already done.
@@ -346,6 +353,7 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 |---------|-----|
 | `NOT_AUTHENTICATED` | Run setup Steps 2-5 above |
 | `REFRESH_FAILED` | Token revoked or expired — redo Steps 3-5 |
+| `REAUTH_REQUIRED` / `invalid_rapt` | Google requires interactive reauth for this human OAuth token. For cron, use a dedicated minimal-scope profile or service-account delegation instead of reusing a broad admin token. |
 | `HttpError 403: Insufficient Permission` | Missing API scope — `$GSETUP --revoke` then redo Steps 3-5 |
 | `AUTHENTICATED (partial)` or "Token missing scopes" | New write capabilities (Drive write/delete, Docs create/edit) require re-authorization. `$GSETUP --revoke` then redo Steps 3-5 to grant the upgraded scopes. |
 | `HttpError 403: Access Not Configured` | API not enabled — user needs to enable it in Google Cloud Console |
