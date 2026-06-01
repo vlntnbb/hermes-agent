@@ -56,10 +56,10 @@ SCOPES = [
 ]
 
 
-def configure_account(account: str | None = None):
+def configure_account(account: str | None = None, profile: str | None = None):
     """Select which account-scoped Google token this process should use."""
     global _ACTIVE_ACCOUNT_PATHS, TOKEN_PATH, CLIENT_SECRET_PATH
-    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account, home=HERMES_HOME)
+    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account, profile=profile, home=HERMES_HOME)
     TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
     CLIENT_SECRET_PATH = _ACTIVE_ACCOUNT_PATHS.client_secret_path
     return _ACTIVE_ACCOUNT_PATHS
@@ -88,6 +88,35 @@ def _stored_token_scopes() -> list[str]:
     if isinstance(scopes, list) and scopes:
         return scopes
     return list(SCOPES)
+
+
+def _hydrate_stored_token_client_fields() -> dict:
+    """Refresh token metadata from the selected account's client-secret file."""
+    try:
+        data = json.loads(TOKEN_PATH.read_text())
+    except Exception:
+        return {}
+    try:
+        raw = json.loads(CLIENT_SECRET_PATH.read_text())
+        client = raw.get("installed") or raw.get("web") or raw
+    except Exception:
+        client = {}
+    changed = False
+    for src, dst in (
+        ("client_id", "client_id"),
+        ("client_secret", "client_secret"),
+        ("token_uri", "token_uri"),
+    ):
+        if client.get(src) and data.get(dst) != client[src]:
+            data[dst] = client[src]
+            changed = True
+    if not data.get("token_uri"):
+        data["token_uri"] = "https://oauth2.googleapis.com/token"
+        changed = True
+    if changed:
+        TOKEN_PATH.write_text(json.dumps(_normalize_authorized_user_payload(data), indent=2))
+        write_account_metadata(_ACTIVE_ACCOUNT_PATHS)
+    return data
 
 
 def _gws_binary() -> str | None:
@@ -196,6 +225,7 @@ def get_credentials():
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
+    _hydrate_stored_token_client_fields()
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
@@ -1064,8 +1094,9 @@ def _docs_insert_text(doc_id: str, text: str, index: int) -> None:
 # =========================================================================
 
 
-def _pop_account_arg(argv: list[str]) -> tuple[str | None, list[str]]:
+def _pop_account_profile_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
     account = None
+    profile = None
     remaining: list[str] = []
     i = 0
     while i < len(argv):
@@ -1081,9 +1112,20 @@ def _pop_account_arg(argv: list[str]) -> tuple[str | None, list[str]]:
             account = arg.split("=", 1)[1]
             i += 1
             continue
+        if arg == "--profile":
+            if i + 1 >= len(argv):
+                print("ERROR: --profile requires a credential profile value.", file=sys.stderr)
+                sys.exit(2)
+            profile = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1]
+            i += 1
+            continue
         remaining.append(arg)
         i += 1
-    return account, remaining
+    return account, profile, remaining
 
 
 def main():
@@ -1093,6 +1135,13 @@ def main():
         help=(
             "Google account email to use. This option may appear before or after "
             "the service command."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        help=(
+            "Credential profile for the selected account. This option may appear "
+            "before or after the service command."
         ),
     )
     sub = parser.add_subparsers(dest="service", required=True)
@@ -1259,8 +1308,8 @@ def main():
     p.add_argument("--text", required=True, help="Text to append to the end of the document")
     p.set_defaults(func=docs_append)
 
-    account, argv = _pop_account_arg(sys.argv[1:])
-    configure_account(account)
+    account, profile, argv = _pop_account_profile_args(sys.argv[1:])
+    configure_account(account, profile)
     args = parser.parse_args(argv)
     args.func(args)
 

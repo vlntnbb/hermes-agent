@@ -60,6 +60,16 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents",
 ]
+FUNNEL_SYNC_SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+]
+SCOPE_SETS = {
+    "workspace": SCOPES,
+    "funnel-sync": FUNNEL_SYNC_SCOPES,
+}
+_ACTIVE_SCOPE_SET = "workspace"
 
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
 
@@ -69,14 +79,28 @@ REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google
 REDIRECT_URI = "http://localhost:1"
 
 
-def select_google_account(account: str | None = None):
+def select_google_account(
+    account: str | None = None,
+    profile: str | None = None,
+    scope_set: str | None = None,
+):
     """Select the Google account path set for this process."""
-    global _ACTIVE_ACCOUNT_PATHS, TOKEN_PATH, CLIENT_SECRET_PATH, PENDING_AUTH_PATH
-    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account, home=HERMES_HOME)
+    global _ACTIVE_ACCOUNT_PATHS, TOKEN_PATH, CLIENT_SECRET_PATH, PENDING_AUTH_PATH, _ACTIVE_SCOPE_SET
+    _ACTIVE_ACCOUNT_PATHS = resolve_google_account_paths(account, profile=profile, home=HERMES_HOME)
     TOKEN_PATH = _ACTIVE_ACCOUNT_PATHS.token_path
     CLIENT_SECRET_PATH = _ACTIVE_ACCOUNT_PATHS.client_secret_path
     PENDING_AUTH_PATH = _ACTIVE_ACCOUNT_PATHS.pending_auth_path
+    if scope_set:
+        _ACTIVE_SCOPE_SET = scope_set
+    elif _ACTIVE_ACCOUNT_PATHS.profile == "funnel-sync":
+        _ACTIVE_SCOPE_SET = "funnel-sync"
+    else:
+        _ACTIVE_SCOPE_SET = "workspace"
     return _ACTIVE_ACCOUNT_PATHS
+
+
+def active_scopes() -> list[str]:
+    return list(SCOPE_SETS.get(_ACTIVE_SCOPE_SET, SCOPES))
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -93,12 +117,40 @@ def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
         return {}
 
 
+def _hydrate_token_payload_from_client_secret(path: Path = TOKEN_PATH) -> dict:
+    """Keep token refresh metadata synced with the selected client secret."""
+    payload = _load_token_payload(path)
+    if not payload:
+        return payload
+    try:
+        raw = json.loads(CLIENT_SECRET_PATH.read_text())
+        client = raw.get("installed") or raw.get("web") or raw
+    except Exception:
+        client = {}
+    changed = False
+    for src, dst in (
+        ("client_id", "client_id"),
+        ("client_secret", "client_secret"),
+        ("token_uri", "token_uri"),
+    ):
+        if client.get(src) and payload.get(dst) != client[src]:
+            payload[dst] = client[src]
+            changed = True
+    if not payload.get("token_uri"):
+        payload["token_uri"] = "https://oauth2.googleapis.com/token"
+        changed = True
+    if changed:
+        path.write_text(json.dumps(_normalize_authorized_user_payload(payload), indent=2))
+        write_account_metadata(_ACTIVE_ACCOUNT_PATHS)
+    return payload
+
+
 def _missing_scopes_from_payload(payload: dict) -> list[str]:
     raw = payload.get("scopes") or payload.get("scope")
     if not raw:
         return []
     granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
+    return sorted(scope for scope in active_scopes() if scope not in granted)
 
 
 def _format_missing_scopes(missing_scopes: list[str]) -> str:
@@ -189,6 +241,7 @@ def check_auth(quiet: bool = False):
         # Passing scopes forces google-auth to validate them on refresh,
         # which fails with invalid_scope if the token has fewer scopes
         # than requested.
+        _hydrate_token_payload_from_client_secret(TOKEN_PATH)
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
     except Exception as e:
         print(f"TOKEN_CORRUPT: {e}")
@@ -233,6 +286,11 @@ def check_auth(quiet: bool = False):
                 print("    3. If the account is disabled, you can appeal at accounts.google.com/signin/recovery")
                 print("    4. Do NOT retry API calls with a disabled account — this may worsen the situation")
                 print("    5. If the OAuth client is disabled, create a new one in Google Cloud Console")
+            elif "invalid_rapt" in err_str or "reauthentication is needed" in err_str:
+                print(f"REAUTH_REQUIRED: {e}")
+                print("  Google requires an interactive re-auth proof for this refresh token.")
+                print("  This human OAuth token is not suitable for unattended cron until re-authorized.")
+                print("  Prefer a dedicated minimal-scope cron profile or service-account delegation.")
             elif "token_revoked" in err_str or "invalid_grant" in err_str:
                 print(f"TOKEN_REVOKED: {e}")
                 print("  Re-run setup to re-authenticate.")
@@ -336,7 +394,7 @@ def get_auth_url():
 
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
+        scopes=active_scopes(),
         redirect_uri=REDIRECT_URI,
         autogenerate_code_verifier=True,
     )
@@ -367,7 +425,8 @@ def exchange_auth_code(code: str):
     from urllib.parse import parse_qs, urlparse
 
     # Extract granted scopes from the callback URL if the user pasted the full redirect URL.
-    granted_scopes = list(SCOPES)
+    requested_scopes = active_scopes()
+    granted_scopes = list(requested_scopes)
     if isinstance(raw_callback, str) and raw_callback.startswith("http"):
         params = parse_qs(urlparse(raw_callback).query)
         scope_val = (params.get("scope") or [""])[0].strip()
@@ -400,7 +459,7 @@ def exchange_auth_code(code: str):
     actually_granted = list(creds.granted_scopes or []) if hasattr(creds, "granted_scopes") and creds.granted_scopes else []
     if actually_granted:
         token_payload["scopes"] = actually_granted
-    elif granted_scopes != SCOPES:
+    elif granted_scopes != requested_scopes:
         # granted_scopes was extracted from the callback URL
         token_payload["scopes"] = granted_scopes
 
@@ -420,6 +479,8 @@ def exchange_auth_code(code: str):
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
     if _ACTIVE_ACCOUNT_PATHS.account:
         print(f"Google account: {_ACTIVE_ACCOUNT_PATHS.account}")
+    if _ACTIVE_ACCOUNT_PATHS.profile:
+        print(f"Google profile: {_ACTIVE_ACCOUNT_PATHS.profile}")
     print(f"Profile-scoped token location: {TOKEN_PATH}")
 
 
@@ -434,7 +495,7 @@ def revoke():
     from google.auth.transport.requests import Request
 
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), active_scopes())
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
 
@@ -466,6 +527,22 @@ def main():
         ),
     )
     parser.add_argument(
+        "--profile",
+        help=(
+            "Credential profile for the selected account, e.g. 'funnel-sync' or "
+            "'sysadmin'. Profiles isolate tokens under "
+            "~/.hermes/google/accounts/<account>/profiles/<profile>/."
+        ),
+    )
+    parser.add_argument(
+        "--scope-set",
+        choices=sorted(SCOPE_SETS),
+        help=(
+            "OAuth scope bundle to request/check. Defaults to 'funnel-sync' "
+            "for --profile funnel-sync, otherwise 'workspace'."
+        ),
+    )
+    parser.add_argument(
         "--make-default",
         action="store_true",
         help="Make the selected or migrated account the default for future Google Workspace commands.",
@@ -494,8 +571,9 @@ def main():
             return
         for account in accounts:
             marker = "*" if account["default"] else " "
+            profile = f":{account['profile']}" if account.get("profile") else ""
             print(
-                f"{marker} {account['account']} "
+                f"{marker} {account['account']}{profile} "
                 f"token={'yes' if account['token'] else 'no'} "
                 f"client_secret={'yes' if account['client_secret'] else 'no'} "
                 f"path={account['path']}"
@@ -510,6 +588,7 @@ def main():
     if args.migrate_legacy:
         paths = migrate_legacy_account(
             args.migrate_legacy,
+            profile=args.profile,
             home=HERMES_HOME,
             make_default=args.make_default,
         )
@@ -517,7 +596,7 @@ def main():
         print(f"OK: Legacy Google credentials copied to {paths.root}{suffix}.")
         return
 
-    select_google_account(args.account)
+    select_google_account(args.account, args.profile, args.scope_set)
     if args.make_default:
         if not _ACTIVE_ACCOUNT_PATHS.account:
             print("ERROR: --make-default requires --account ACCOUNT.")

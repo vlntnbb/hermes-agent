@@ -50,6 +50,27 @@ def test_named_account_paths_are_isolated(monkeypatch, tmp_path):
     )
 
 
+def test_named_account_profile_paths_isolate_token_but_share_client_secret(monkeypatch, tmp_path):
+    module = _load_helper(monkeypatch, tmp_path)
+    hermes_home = tmp_path / ".hermes"
+
+    paths = module.resolve_google_account_paths("User+One@Example.COM", profile="Funnel-Sync")
+
+    assert paths.account == "user+one@example.com"
+    assert paths.profile == "funnel-sync"
+    assert paths.token_path == (
+        hermes_home
+        / "google/accounts/user+one@example.com/profiles/funnel-sync/google_token.json"
+    )
+    assert paths.pending_auth_path == (
+        hermes_home
+        / "google/accounts/user+one@example.com/profiles/funnel-sync/google_oauth_pending.json"
+    )
+    assert paths.client_secret_path == (
+        hermes_home / "google/accounts/user+one@example.com/google_client_secret.json"
+    )
+
+
 def test_default_account_marker_selects_named_account(monkeypatch, tmp_path):
     module = _load_helper(monkeypatch, tmp_path)
 
@@ -75,3 +96,20 @@ def test_migrate_legacy_account_copies_credentials(monkeypatch, tmp_path):
     assert module.read_default_account() == "user@example.com"
     metadata = json.loads(paths.metadata_path.read_text())
     assert metadata["account"] == "user@example.com"
+
+
+def test_migrate_legacy_account_to_profile(monkeypatch, tmp_path):
+    module = _load_helper(monkeypatch, tmp_path)
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "google_token.json").write_text(json.dumps({"token": "t"}))
+    (hermes_home / "google_client_secret.json").write_text(json.dumps({"installed": {}}))
+
+    paths = module.migrate_legacy_account("user@example.com", profile="sysadmin")
+
+    assert paths.token_path.exists()
+    assert paths.token_path.parent.name == "sysadmin"
+    assert paths.client_secret_path.exists()
+    metadata = json.loads(paths.metadata_path.read_text())
+    assert metadata["account"] == "user@example.com"
+    assert metadata["profile"] == "sysadmin"

@@ -24,20 +24,24 @@ LEGACY_CLIENT_SECRET_NAME = "google_client_secret.json"
 LEGACY_PENDING_AUTH_NAME = "google_oauth_pending.json"
 DEFAULT_ACCOUNT_NAME = "default_account"
 ACCOUNT_METADATA_NAME = "account.json"
+PROFILES_DIR_NAME = "profiles"
 
 
 @dataclass(frozen=True)
 class GoogleAccountPaths:
     account: str | None
+    profile: str | None
     root: Path
     token_path: Path
     client_secret_path: Path
     pending_auth_path: Path
     metadata_path: Path | None = None
+    account_root: Path | None = None
 
     @property
     def label(self) -> str:
-        return self.account or "legacy"
+        base = self.account or "legacy"
+        return f"{base}:{self.profile}" if self.profile else base
 
 
 def _home(home: Path | None = None) -> Path:
@@ -59,9 +63,20 @@ def normalize_account(account: str | None) -> str | None:
     return value or None
 
 
+def normalize_profile(profile: str | None) -> str | None:
+    if profile is None:
+        return None
+    value = profile.strip().lower()
+    return value or None
+
+
 def account_slug(account: str) -> str:
     # Keep email-like names readable while making path separators impossible.
     return quote(account, safe="@._+-")
+
+
+def profile_slug(profile: str) -> str:
+    return quote(profile, safe="@._+-")
 
 
 def account_from_slug(slug: str) -> str:
@@ -78,33 +93,61 @@ def read_default_account(home: Path | None = None) -> str | None:
 
 def resolve_google_account_paths(
     account: str | None = None,
+    profile: str | None = None,
     *,
     home: Path | None = None,
 ) -> GoogleAccountPaths:
     hermes_home = _home(home)
+    selected_profile = (
+        normalize_profile(profile)
+        or normalize_profile(os.getenv("HERMES_GOOGLE_PROFILE"))
+    )
     selected = (
         normalize_account(account)
         or normalize_account(os.getenv("HERMES_GOOGLE_ACCOUNT"))
         or read_default_account(hermes_home)
     )
     if not selected:
+        if selected_profile:
+            root = hermes_home / "google" / PROFILES_DIR_NAME / profile_slug(selected_profile)
+            return GoogleAccountPaths(
+                account=None,
+                profile=selected_profile,
+                root=root,
+                token_path=root / LEGACY_TOKEN_NAME,
+                client_secret_path=hermes_home / LEGACY_CLIENT_SECRET_NAME,
+                pending_auth_path=root / LEGACY_PENDING_AUTH_NAME,
+                metadata_path=root / ACCOUNT_METADATA_NAME,
+                account_root=None,
+            )
         return GoogleAccountPaths(
             account=None,
+            profile=None,
             root=hermes_home,
             token_path=hermes_home / LEGACY_TOKEN_NAME,
             client_secret_path=hermes_home / LEGACY_CLIENT_SECRET_NAME,
             pending_auth_path=hermes_home / LEGACY_PENDING_AUTH_NAME,
             metadata_path=None,
+            account_root=None,
         )
 
-    root = accounts_root(hermes_home) / account_slug(selected)
+    account_root = accounts_root(hermes_home) / account_slug(selected)
+    root = (
+        account_root / PROFILES_DIR_NAME / profile_slug(selected_profile)
+        if selected_profile
+        else account_root
+    )
     return GoogleAccountPaths(
         account=selected,
+        profile=selected_profile,
         root=root,
         token_path=root / LEGACY_TOKEN_NAME,
-        client_secret_path=root / LEGACY_CLIENT_SECRET_NAME,
+        # Profiles intentionally share the OAuth client secret with the
+        # account.  Tokens and pending PKCE sessions are profile-isolated.
+        client_secret_path=account_root / LEGACY_CLIENT_SECRET_NAME,
         pending_auth_path=root / LEGACY_PENDING_AUTH_NAME,
         metadata_path=root / ACCOUNT_METADATA_NAME,
+        account_root=account_root,
     )
 
 
@@ -113,12 +156,24 @@ def ensure_account_dir(paths: GoogleAccountPaths) -> None:
 
 
 def write_account_metadata(paths: GoogleAccountPaths) -> None:
-    if not paths.metadata_path or not paths.account:
+    if not paths.metadata_path:
         return
     ensure_account_dir(paths)
     paths.metadata_path.write_text(
-        json.dumps({"account": paths.account}, indent=2) + "\n"
+        json.dumps(
+            {
+                "account": paths.account,
+                **({"profile": paths.profile} if paths.profile else {}),
+            },
+            indent=2,
+        )
+        + "\n"
     )
+    if paths.account_root and paths.account:
+        paths.account_root.mkdir(parents=True, exist_ok=True)
+        root_metadata = paths.account_root / ACCOUNT_METADATA_NAME
+        if not root_metadata.exists():
+            root_metadata.write_text(json.dumps({"account": paths.account}, indent=2) + "\n")
 
 
 def set_default_account(account: str, *, home: Path | None = None) -> GoogleAccountPaths:
@@ -140,13 +195,14 @@ def _chmod_secret(path: Path) -> None:
 
 def migrate_legacy_account(
     account: str,
+    profile: str | None = None,
     *,
     home: Path | None = None,
     overwrite: bool = False,
     make_default: bool = False,
 ) -> GoogleAccountPaths:
     hermes_home = _home(home)
-    paths = resolve_google_account_paths(account, home=hermes_home)
+    paths = resolve_google_account_paths(account, profile=profile, home=hermes_home)
     ensure_account_dir(paths)
     copied = False
     for src, dst in (
@@ -181,6 +237,7 @@ def list_google_accounts(home: Path | None = None) -> list[dict[str, object]]:
         accounts.append(
             {
                 "account": "legacy",
+                "profile": None,
                 "default": default is None,
                 "token": legacy_token.exists(),
                 "client_secret": legacy_client.exists(),
@@ -201,10 +258,31 @@ def list_google_accounts(home: Path | None = None) -> list[dict[str, object]]:
             accounts.append(
                 {
                     "account": account,
+                    "profile": None,
                     "default": account == default,
                     "token": (child / LEGACY_TOKEN_NAME).exists(),
                     "client_secret": (child / LEGACY_CLIENT_SECRET_NAME).exists(),
                     "path": str(child),
                 }
             )
+            profiles_root = child / PROFILES_DIR_NAME
+            if profiles_root.exists():
+                for profile_dir in sorted(p for p in profiles_root.iterdir() if p.is_dir()):
+                    profile = profile_dir.name
+                    profile_metadata_path = profile_dir / ACCOUNT_METADATA_NAME
+                    try:
+                        profile_metadata = json.loads(profile_metadata_path.read_text())
+                        profile = normalize_profile(profile_metadata.get("profile")) or profile
+                    except Exception:
+                        pass
+                    accounts.append(
+                        {
+                            "account": account,
+                            "profile": profile,
+                            "default": False,
+                            "token": (profile_dir / LEGACY_TOKEN_NAME).exists(),
+                            "client_secret": (child / LEGACY_CLIENT_SECRET_NAME).exists(),
+                            "path": str(profile_dir),
+                        }
+                    )
     return accounts
