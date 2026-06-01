@@ -29,7 +29,8 @@ Use this skill after the BFM document onboarding step is ready. It provisions th
 - Google Workspace domain is `buildfuture.me`.
 - Corporate email format is `name.surname@buildfuture.me`.
 - Google OAuth for `val@buildfuture.me` must include Admin SDK Directory user scope and Gmail send scope.
-- If the existing Google token is missing Admin SDK scope, use this skill's `google-auth-url` and `google-auth-code` commands to re-authorize the same account.
+- This skill uses the Google credential profile `sysadmin` by default, stored separately from cron profiles such as `funnel-sync`.
+- If the existing Google token is missing Admin SDK scope, use this skill's `google-auth-url` and `google-auth-code` commands to re-authorize the `sysadmin` profile for the same account.
 - Time Doctor admin credentials must be saved in Hermes environment variables: `TIMEDOCTOR_ACCESS_TOKEN` and `TIMEDOCTOR_REFRESH_TOKEN`, or legacy `TIMEDOCTOR_TOKEN`.
 - Time Doctor company defaults to `TIMEDOCTOR_COMPANY_ID` or the first company visible to `val@buildfuture.me`.
 - Drive folder grants are disabled by default; only pass Drive folder IDs when the user explicitly asks.

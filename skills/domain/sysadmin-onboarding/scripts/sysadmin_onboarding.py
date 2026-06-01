@@ -45,6 +45,7 @@ TIME_DOCTOR_BASE_URL = "https://api2.timedoctor.com/api"
 TIME_DOCTOR_LOGIN_URL = "https://web.timedoctor.com/"
 REDIRECT_URI = "http://localhost:1"
 GOOGLE_PENDING_AUTH_NAME = "sysadmin_google_oauth_pending.json"
+GOOGLE_PROFILE = os.getenv("BFM_SYSADMIN_GOOGLE_PROFILE", "sysadmin")
 GOOGLE_ADMIN_SCOPE = "https://www.googleapis.com/auth/admin.directory.user"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
@@ -115,20 +116,27 @@ def account_root(account: str) -> Path:
     return get_hermes_home() / "google" / "accounts" / slug
 
 
-def google_token_path(account: str) -> Path:
-    return account_root(account) / "google_token.json"
+def google_profile_root(account: str, profile: str | None = GOOGLE_PROFILE) -> Path:
+    root = account_root(account)
+    if profile:
+        return root / "profiles" / urllib.parse.quote(profile.strip().lower(), safe="@._+-")
+    return root
+
+
+def google_token_path(account: str, profile: str | None = GOOGLE_PROFILE) -> Path:
+    return google_profile_root(account, profile) / "google_token.json"
 
 
 def google_client_secret_path(account: str) -> Path:
     return account_root(account) / "google_client_secret.json"
 
 
-def google_pending_auth_path(account: str) -> Path:
-    return account_root(account) / GOOGLE_PENDING_AUTH_NAME
+def google_pending_auth_path(account: str, profile: str | None = GOOGLE_PROFILE) -> Path:
+    return google_profile_root(account, profile) / GOOGLE_PENDING_AUTH_NAME
 
 
-def google_credentials(account: str, *, include_drive: bool = False) -> Credentials:
-    token_path = google_token_path(account)
+def google_credentials(account: str, *, include_drive: bool = False, profile: str | None = GOOGLE_PROFILE) -> Credentials:
+    token_path = google_token_path(account, profile)
     if not token_path.exists():
         raise OnboardingError(f"Google token not found: {token_path}")
     scopes = GOOGLE_SCOPES_WITH_DRIVE if include_drive else GOOGLE_SCOPES
@@ -143,12 +151,24 @@ def google_credentials(account: str, *, include_drive: bool = False) -> Credenti
     return creds
 
 
-def google_service(api: str, version: str, account: str, *, include_drive: bool = False) -> Any:
-    return build(api, version, credentials=google_credentials(account, include_drive=include_drive), cache_discovery=False)
+def google_service(
+    api: str,
+    version: str,
+    account: str,
+    *,
+    include_drive: bool = False,
+    profile: str | None = GOOGLE_PROFILE,
+) -> Any:
+    return build(
+        api,
+        version,
+        credentials=google_credentials(account, include_drive=include_drive, profile=profile),
+        cache_discovery=False,
+    )
 
 
-def stored_google_scopes(account: str) -> list[str]:
-    token_path = google_token_path(account)
+def stored_google_scopes(account: str, profile: str | None = GOOGLE_PROFILE) -> list[str]:
+    token_path = google_token_path(account, profile)
     try:
         payload = json.loads(token_path.read_text(encoding="utf-8"))
     except Exception:
@@ -161,8 +181,8 @@ def stored_google_scopes(account: str) -> list[str]:
     return []
 
 
-def missing_google_auth_scopes(account: str) -> list[str]:
-    granted = set(stored_google_scopes(account))
+def missing_google_auth_scopes(account: str, profile: str | None = GOOGLE_PROFILE) -> list[str]:
+    granted = set(stored_google_scopes(account, profile))
     if not granted:
         return []
     return sorted(scope for scope in GOOGLE_AUTH_SCOPES if scope not in granted)
@@ -202,7 +222,7 @@ def google_auth_url(args: argparse.Namespace) -> int:
         prompt="consent",
         include_granted_scopes="true",
     )
-    pending_path = google_pending_auth_path(args.google_admin)
+    pending_path = google_pending_auth_path(args.google_admin, args.google_profile)
     pending_path.parent.mkdir(parents=True, exist_ok=True)
     pending_path.write_text(
         json.dumps(
@@ -221,13 +241,19 @@ def google_auth_url(args: argparse.Namespace) -> int:
         pending_path.chmod(0o600)
     except OSError:
         pass
-    print_json({"ok": True, "google_admin": args.google_admin, "auth_url": auth_url, "pending_path": str(pending_path)})
+    print_json({
+        "ok": True,
+        "google_admin": args.google_admin,
+        "google_profile": args.google_profile,
+        "auth_url": auth_url,
+        "pending_path": str(pending_path),
+    })
     return 0
 
 
 def google_auth_code(args: argparse.Namespace) -> int:
     client_secret = google_client_secret_path(args.google_admin)
-    pending_path = google_pending_auth_path(args.google_admin)
+    pending_path = google_pending_auth_path(args.google_admin, args.google_profile)
     if not client_secret.exists():
         raise OnboardingError(f"Google client secret not found: {client_secret}")
     if not pending_path.exists():
@@ -256,7 +282,7 @@ def google_auth_code(args: argparse.Namespace) -> int:
     if getattr(flow.credentials, "granted_scopes", None):
         payload["scopes"] = list(flow.credentials.granted_scopes or [])
 
-    token_path = google_token_path(args.google_admin)
+    token_path = google_token_path(args.google_admin, args.google_profile)
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     try:
@@ -265,11 +291,12 @@ def google_auth_code(args: argparse.Namespace) -> int:
         pass
     pending_path.unlink(missing_ok=True)
 
-    missing = missing_google_auth_scopes(args.google_admin)
+    missing = missing_google_auth_scopes(args.google_admin, args.google_profile)
     print_json(
         {
             "ok": not missing,
             "google_admin": args.google_admin,
+            "google_profile": args.google_profile,
             "token_path": str(token_path),
             "missing_scopes": missing,
         }
@@ -278,7 +305,7 @@ def google_auth_code(args: argparse.Namespace) -> int:
 
 
 def enable_admin_sdk_api(args: argparse.Namespace) -> int:
-    creds = google_credentials(args.google_admin)
+    creds = google_credentials(args.google_admin, profile=args.google_profile)
     service = build("serviceusage", "v1", credentials=creds, cache_discovery=False)
     name = f"projects/{args.project}/services/admin.googleapis.com"
     operation = service.services().enable(name=name, body={}).execute()
@@ -598,6 +625,7 @@ def common_result(args: argparse.Namespace, candidate: Candidate) -> dict[str, A
         "defaults": {
             "domain": args.domain,
             "google_admin": args.google_admin,
+            "google_profile": args.google_profile,
             "drive_folder_count": len(args.drive_folder_id or []),
             "timedoctor_role": args.timedoctor_role,
             "send_handoff_email": not args.no_send_email,
@@ -605,13 +633,21 @@ def common_result(args: argparse.Namespace, candidate: Candidate) -> dict[str, A
     }
 
 
-def verify_access(_: argparse.Namespace) -> int:
-    result: dict[str, Any] = {"ok": True, "google": {"stored_missing_scopes": missing_google_auth_scopes(ADMIN_ACCOUNT)}, "timedoctor": {}}
+def verify_access(args: argparse.Namespace) -> int:
+    result: dict[str, Any] = {
+        "ok": True,
+        "google": {
+            "admin": args.google_admin,
+            "profile": args.google_profile,
+            "stored_missing_scopes": missing_google_auth_scopes(args.google_admin, args.google_profile),
+        },
+        "timedoctor": {},
+    }
     if result["google"]["stored_missing_scopes"]:
         result["ok"] = False
     try:
-        directory = google_service("admin", "directory_v1", ADMIN_ACCOUNT)
-        admin_user = directory.users().get(userKey=ADMIN_ACCOUNT).execute()
+        directory = google_service("admin", "directory_v1", args.google_admin, profile=args.google_profile)
+        admin_user = directory.users().get(userKey=args.google_admin).execute()
         result["google"]["directory"] = {
             "ok": True,
             "admin_email": admin_user.get("primaryEmail"),
@@ -622,7 +658,7 @@ def verify_access(_: argparse.Namespace) -> int:
         result["google"]["directory"] = error_dict(exc)
 
     try:
-        gmail = google_service("gmail", "v1", ADMIN_ACCOUNT)
+        gmail = google_service("gmail", "v1", args.google_admin, profile=args.google_profile)
         profile = gmail.users().getProfile(userId="me").execute()
         result["google"]["gmail"] = {"ok": True, "email": profile.get("emailAddress")}
     except Exception as exc:
@@ -687,7 +723,13 @@ def run(args: argparse.Namespace) -> int:
     company_id = args.timedoctor_company_id or client.resolve_company_id()
     client.authorization(company_id)
 
-    directory = google_service("admin", "directory_v1", args.google_admin, include_drive=include_drive)
+    directory = google_service(
+        "admin",
+        "directory_v1",
+        args.google_admin,
+        include_drive=include_drive,
+        profile=args.google_profile,
+    )
     existing_google = get_google_user(directory, candidate.corporate_email)
     google_created = False
     if existing_google:
@@ -708,7 +750,13 @@ def run(args: argparse.Namespace) -> int:
 
     drive_results = []
     if args.drive_folder_id:
-        drive = google_service("drive", "v3", args.google_admin, include_drive=True)
+        drive = google_service(
+            "drive",
+            "v3",
+            args.google_admin,
+            include_drive=True,
+            profile=args.google_profile,
+        )
         for folder_id in args.drive_folder_id:
             permission = grant_drive_access(drive, folder_id=folder_id, email=candidate.corporate_email, role=args.drive_role)
             drive_results.append({"folder_id": folder_id, "permission": permission})
@@ -728,7 +776,13 @@ def run(args: argparse.Namespace) -> int:
     timedoctor_created = td_result.get("status") == "invited"
 
     if not args.no_send_email:
-        gmail = google_service("gmail", "v1", args.google_admin, include_drive=include_drive)
+        gmail = google_service(
+            "gmail",
+            "v1",
+            args.google_admin,
+            include_drive=include_drive,
+            profile=args.google_profile,
+        )
         sent = gmail_send(
             gmail,
             sender=args.google_admin,
@@ -771,6 +825,7 @@ def add_candidate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--corporate-email")
     parser.add_argument("--domain", default=DOMAIN)
     parser.add_argument("--google-admin", default=ADMIN_ACCOUNT)
+    parser.add_argument("--google-profile", default=GOOGLE_PROFILE)
     parser.add_argument("--role", default="Project Manager")
     parser.add_argument("--drive-folder-id", action="append", default=[])
     parser.add_argument("--drive-role", choices=("reader", "commenter", "writer"), default="reader")
@@ -789,19 +844,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     verify = sub.add_parser("verify-access", help="Check Google admin, Gmail, and Time Doctor access.")
+    verify.add_argument("--google-admin", default=ADMIN_ACCOUNT)
+    verify.add_argument("--google-profile", default=GOOGLE_PROFILE)
     verify.set_defaults(func=verify_access)
 
     auth_url = sub.add_parser("google-auth-url", help="Create a Google OAuth URL with sysadmin scopes.")
     auth_url.add_argument("--google-admin", default=ADMIN_ACCOUNT)
+    auth_url.add_argument("--google-profile", default=GOOGLE_PROFILE)
     auth_url.set_defaults(func=google_auth_url)
 
     auth_code = sub.add_parser("google-auth-code", help="Save Google OAuth callback code for sysadmin scopes.")
     auth_code.add_argument("code")
     auth_code.add_argument("--google-admin", default=ADMIN_ACCOUNT)
+    auth_code.add_argument("--google-profile", default=GOOGLE_PROFILE)
     auth_code.set_defaults(func=google_auth_code)
 
     enable_api = sub.add_parser("enable-admin-sdk-api", help="Enable Admin SDK API in the OAuth Google Cloud project.")
     enable_api.add_argument("--google-admin", default=ADMIN_ACCOUNT)
+    enable_api.add_argument("--google-profile", default=GOOGLE_PROFILE)
     enable_api.add_argument("--project", default="381203265311")
     enable_api.set_defaults(func=enable_admin_sdk_api)
 
