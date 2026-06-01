@@ -9234,21 +9234,13 @@ def _restore_update_workspace(
             input_fn=input_fn,
         )
     if original_branch and original_branch not in {"HEAD"}:
-        current = subprocess.run(
-            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        subprocess.run(
+            git_cmd + ["checkout", original_branch],
             cwd=cwd,
             capture_output=True,
             text=True,
             check=False,
         )
-        if (current.stdout or "").strip() != original_branch:
-            subprocess.run(
-                git_cmd + ["checkout", original_branch],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
 
 
 def _run_rebase_local_update(
@@ -9582,6 +9574,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # CLI behavior); --branch overrides for callers that want to update
         # against a non-default channel.
         branch = _resolve_update_branch(args)
+        restore_branch = (
+            current_branch
+            if current_branch != branch and current_branch != "HEAD"
+            else None
+        )
 
         if rebase_local:
             changed = _run_rebase_local_update(
@@ -9637,7 +9634,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 auto_stash_ref,
                                 prompt_for_restore=False,
                                 input_fn=gw_input_fn,
-                                original_branch=current_branch,
+                                original_branch=restore_branch,
                             )
                         print(f"✗ Branch '{branch}' does not exist locally or on origin.")
                         if track_result.stderr.strip():
@@ -9675,7 +9672,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     auto_stash_ref,
                     prompt_for_restore=prompt_for_restore,
                     input_fn=gw_input_fn,
-                    original_branch=current_branch,
+                    original_branch=restore_branch,
                 )
                 print("✓ Already up to date!")
                 return
@@ -9692,7 +9689,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     auto_stash_ref,
                     prompt_for_restore=prompt_for_restore,
                     input_fn=gw_input_fn,
-                    original_branch=current_branch,
+                    original_branch=restore_branch,
                 )
                 print(
                     f"✗ Local {branch} has {local_ahead} commit(s) that are not on origin/{branch}."
@@ -9819,7 +9816,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             auto_stash_ref,
                             prompt_for_restore=prompt_for_restore,
                             input_fn=gw_input_fn,
-                            original_branch=current_branch,
+                            original_branch=restore_branch,
                         )
 
         _invalidate_update_cache()

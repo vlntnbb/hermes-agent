@@ -39,6 +39,18 @@ def mock_args():
     return SimpleNamespace()
 
 
+@pytest.fixture(autouse=True)
+def _legacy_update_policy(monkeypatch):
+    """Keep legacy update-flow tests independent from user config."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(
+        hm,
+        "_load_update_settings",
+        lambda: {"local_changes_policy": "reset"},
+    )
+
+
 class TestCmdUpdatePip:
     """Regression tests for pip-install update flows."""
 
@@ -96,9 +108,10 @@ class TestCmdUpdateBranchFallback:
 
         # rev-list should use origin/main, not origin/fix/stoicneko
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-        assert "origin/fix/stoicneko" not in rev_list_cmds[0]
+        behind_rev_list_cmds = [c for c in rev_list_cmds if "HEAD..origin/" in c]
+        assert len(behind_rev_list_cmds) == 1
+        assert "origin/main" in behind_rev_list_cmds[0]
+        assert not any("origin/fix/stoicneko" in c for c in rev_list_cmds)
 
         # pull should use main, not fix/stoicneko
         pull_cmds = [c for c in commands if "pull" in c]
@@ -119,8 +132,9 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
+        behind_rev_list_cmds = [c for c in rev_list_cmds if "HEAD..origin/" in c]
+        assert len(behind_rev_list_cmds) == 1
+        assert "origin/main" in behind_rev_list_cmds[0]
 
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1

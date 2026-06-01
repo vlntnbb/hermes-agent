@@ -345,6 +345,19 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
     return value or None
 
 
+def _baked_git_banner_state() -> Optional[dict]:
+    """Return the baked build SHA as a frozen git banner state, when present."""
+    try:
+        from hermes_cli.build_info import get_build_sha
+
+        baked = get_build_sha(short=8)
+        if baked:
+            return {"upstream": baked, "local": baked, "ahead": 0}
+    except Exception:
+        pass
+    return None
+
+
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     """Return upstream/local git hashes for the startup banner.
 
@@ -361,32 +374,18 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
         # No git checkout — try the baked build SHA (Docker image path).
-        try:
-            from hermes_cli.build_info import get_build_sha
-            baked = get_build_sha(short=8)
-            if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
-        except Exception:
-            pass
-        return None
+        return _baked_git_banner_state()
 
     compare_ref = _select_canonical_main_ref(repo_dir, fetch=False)
     if not compare_ref:
-        return None
+        return _baked_git_banner_state()
 
     upstream = _git_short_hash(repo_dir, compare_ref)
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
         # Fall back to the baked build SHA if available.
-        try:
-            from hermes_cli.build_info import get_build_sha
-            baked = get_build_sha(short=8)
-            if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
-        except Exception:
-            pass
-        return None
+        return _baked_git_banner_state()
 
     ahead = 0
     try:

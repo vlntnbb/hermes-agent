@@ -514,6 +514,11 @@ def test_cmd_update_blocks_reset_when_policy_is_block(monkeypatch, tmp_path, cap
     """The default safe policy refuses reset --hard on diverged history."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_load_update_settings",
+        lambda: {"local_changes_policy": "block"},
+    )
 
     side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
@@ -532,6 +537,11 @@ def test_cmd_update_blocks_when_local_commits_would_be_overwritten(monkeypatch, 
     """Local commits on main require the explicit --rebase-local path."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_load_update_settings",
+        lambda: {"local_changes_policy": "block"},
+    )
 
     side_effect, recorded = _make_update_side_effect(local_commit_count="2")
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
